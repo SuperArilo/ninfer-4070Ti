@@ -17,7 +17,11 @@
 #include <system_error>
 #include <utility>
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace ninfer::serve {
 namespace {
@@ -103,9 +107,27 @@ std::string tool_choice_name(const ToolChoice& choice) {
     return "unknown";
 }
 
+const char* reasoning_effort_name(ninfer::ReasoningEffort effort) {
+    switch (effort) {
+    case ninfer::ReasoningEffort::Low:
+        return "low";
+    case ninfer::ReasoningEffort::Medium:
+        return "medium";
+    case ninfer::ReasoningEffort::XHigh:
+        return "xhigh";
+    }
+    return "unknown";
+}
+
 Json requested_reasoning_effort_json(const std::optional<RequestedReasoningEffort>& requested) {
     return requested ? Json(std::string(requested_reasoning_effort_name(*requested)))
                      : Json(nullptr);
+}
+
+Json resolved_reasoning_effort_json(bool enable_thinking,
+                                    const std::optional<ninfer::ReasoningEffort>& resolved) {
+    if (!enable_thinking) { return "none"; }
+    return resolved ? Json(reasoning_effort_name(*resolved)) : Json(nullptr);
 }
 
 const char* kv_cache_name(ninfer::KvCacheStorage storage) {
@@ -120,6 +142,10 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return "rk4v4";
+    case ninfer::KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
     }
     return "unknown";
 }
@@ -214,8 +240,10 @@ Json request_json(const RequestLogContext& context) {
                 {"thinking_budget", std::move(thinking_budget)},
                 {"requested_reasoning_effort",
                  requested_reasoning_effort_json(context.requested_reasoning_effort)},
-                {"preserve_thinking",
-                 context.preserve_thinking ? Json(*context.preserve_thinking) : Json(nullptr)},
+                {"resolved_reasoning_effort",
+                 resolved_reasoning_effort_json(context.enable_thinking,
+                                                context.resolved_reasoning_effort)},
+                {"preserve_thinking", context.preserve_thinking},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
                 {"sampling", sampler_json(context.sampling)}};
 }
@@ -253,7 +281,8 @@ Json rejected_request_json(const RequestRejectionLogContext& context) {
                 {"tool_choice", tool_choice_name(context.tool_choice)},
                 {"has_tool_history", context.has_tool_history},
                 {"requested_reasoning_effort",
-                 requested_reasoning_effort_json(context.requested_reasoning_effort)}};
+                 requested_reasoning_effort_json(context.requested_reasoning_effort)},
+                {"resolved_reasoning_effort", nullptr}};
 }
 
 Json error_json(const ApiError& error) {
@@ -307,19 +336,6 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"budget_exhausted", diagnostics.budget_exhausted},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
-        {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
-        {"first_improvement_ns", diagnostics.first_improvement_ns
-                                     ? Json(*diagnostics.first_improvement_ns)
-                                     : Json(nullptr)},
-        {"incumbent_improvements", diagnostics.incumbent_improvements},
-        {"search_work", diagnostics.search_work},
-        {"search_granted_ns", diagnostics.search_granted_ns},
-        {"search_renewals", diagnostics.search_renewals},
-        {"search_discovery_used", diagnostics.search_discovery_used},
-        {"search_overshoot_ns", diagnostics.search_overshoot_ns},
-        {"search_stop_phase",
-         ninfer::materialization_search_phase_name(diagnostics.search_stop_phase)},
-        {"search_boundary_limited", diagnostics.search_boundary_limited},
     };
 }
 
@@ -420,34 +436,29 @@ std::string format_server_start_json(
         default_thinking_budget = *options.default_thinking_budget;
     }
 
-    record["server"] =
-        Json{{"host", options.host},
-             {"port", options.port},
-             {"public_model_id", public_model_id},
-             {"api_key_configured", !options.api_key.empty()},
-             {"cors_enabled", options.enable_cors},
-             {"max_request_bytes", options.max_request_bytes},
-             {"media_cache_bytes", options.media_cache_bytes},
-             {"media_live_bytes", options.media_live_bytes},
-             {"media_preprocess_threads", options.media_preprocess_threads},
-             {"request_log_jsonl", options.request_log_jsonl},
-             {"default_output_tokens", options.default_max_tokens},
-             {"default_thinking",
-              options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
-             {"default_thinking_budget", std::move(default_thinking_budget)},
-             {"default_preserve_thinking",
-              options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)}};
+    record["server"]                               = Json{{"host", options.host},
+                                                          {"port", options.port},
+                                                          {"public_model_id", public_model_id},
+                                                          {"api_key_configured", !options.api_key.empty()},
+                                                          {"cors_enabled", options.enable_cors},
+                                                          {"max_request_bytes", options.max_request_bytes},
+                                                          {"media_cache_bytes", options.media_cache_bytes},
+                                                          {"media_live_bytes", options.media_live_bytes},
+                                                          {"media_preprocess_threads", options.media_preprocess_threads},
+                                                          {"request_log_jsonl", options.request_log_jsonl},
+                                                          {"default_output_tokens", options.default_max_tokens},
+                                                          {"default_thinking", options.enable_thinking},
+                                                          {"default_thinking_budget", std::move(default_thinking_budget)},
+                                                          {"default_preserve_thinking", options.preserve_thinking}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
                                                           {"size_bytes", std::move(artifact_size)},
-                                                          {"architecture", load.architecture},
-                                                          {"name", load.model_name},
-                                                          {"formats", load.weight_formats},
-                                                          {"prefill_signature", load.prefill_signature},
+                                                          {"target", load.target},
+                                                          {"weights_id", load.weights_id},
                                                           {"bytes_read", load.artifact_bytes_read},
                                                           {"host_to_device_bytes", load.host_to_device_bytes},
                                                           {"peak_staging_bytes", load.peak_staging_bytes},
-                                                          {"device_object_count", load.device_object_count},
-                                                          {"host_object_count", load.host_object_count},
+                                                          {"tensor_count", load.tensor_count},
+                                                          {"resource_count", load.resource_count},
                                                           {"load_seconds", load.load_seconds},
                                                           {"upload_seconds", load.upload_seconds}};
     const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
@@ -480,7 +491,8 @@ std::string format_server_start_json(
                                    {"prefill_source", ninfer::context_cost_preset_source_name(
                                                           context_cost.prefill_source)},
                                    {"hardware_class", context_cost.hardware_class},
-                                   {"prefill_signature", context_cost.prefill_signature},
+                                   {"model_id", context_cost.model_id},
+                                   {"weights_id", context_cost.weights_id},
                                    {"preset_path", context_cost.preset_path.string()}}},
              {"context_cache",
               Json{{"enabled", cache.enabled},

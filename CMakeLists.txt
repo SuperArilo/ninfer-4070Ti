@@ -1,21 +1,23 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_120a. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
-# host-toolchain default or accepts an unsupported target.
+# The reference implementation is compiled for sm_120a (RTX 5090). sm_89 (RTX 4090)
+# is supported for the architecture-generic kernel set (bf16/fp8/k8v4 paths); the
+# warp-specialized SM120 NVFP4 W4A4 TMA kernels are excluded from non-120 builds
+# (see src/CMakeLists.txt). Validate the architecture before CUDA compiler detection
+# so CMake never injects a generic host-toolchain default or accepts an unsupported target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(120a|89)$")
   message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
+    "NInfer supports CMAKE_CUDA_ARCHITECTURES=120a or 89; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
 # --- Global settings ---------------------------------------------------------
-option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
+option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 
@@ -28,19 +30,74 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# sm_89 (RTX 4090) builds enable the capped-shared-memory w8 kernel variants (see
+# src/ops/linear/w8/w8_config.h); the 120a build keeps its default high-memory schedules.
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "89")
+  add_compile_definitions(NINFER_SM89=1)
+endif()
+
+if(MSVC)
+  add_compile_definitions(NOMINMAX UTF8PROC_STATIC)
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:C>:/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:C>:/FS>
+    $<$<COMPILE_LANGUAGE:C>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CXX>:/FS>
+    $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/FS>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+  )
+endif()
+
 if(CMAKE_GENERATOR MATCHES "Ninja")
-  set_property(GLOBAL PROPERTY JOB_POOLS ninfer_link=1)
-  set(CMAKE_JOB_POOL_LINK ninfer_link)
+  set_property(GLOBAL PROPERTY JOB_POOLS cuda_link=1)
+  set(CMAKE_JOB_POOL_LINK cuda_link)
 endif()
 
-# Tests also exercise product input, logging and protocol adapters.
-set(NINFER_BUILD_PRODUCT_SUPPORT OFF)
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+  message(FATAL_ERROR
+    "NInfer requires CUDA 13.1 or newer; found CUDA compiler "
+    "${CMAKE_CUDA_COMPILER_VERSION}")
+endif()
+
+set(NINFER_BUILD_MEDIA_ACQUIRE OFF)
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
-  set(NINFER_BUILD_PRODUCT_SUPPORT ON)
+  set(NINFER_BUILD_MEDIA_ACQUIRE ON)
 endif()
 
-include(cmake/Dependencies.cmake)
-include(cmake/NinferTargets.cmake)
+set(NINFER_BUILD_PROMPT_INPUT OFF)
+if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  set(NINFER_BUILD_PROMPT_INPUT ON)
+endif()
+
+set(NINFER_BUILD_SERVE OFF)
+if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  set(NINFER_BUILD_SERVE ON)
+endif()
+
+find_package(CUDAToolkit REQUIRED)
+if(MSVC)
+  add_library(PkgConfig::FFMPEG INTERFACE IMPORTED)
+  target_include_directories(PkgConfig::FFMPEG INTERFACE "${PROJECT_SOURCE_DIR}/ffmpeg/include")
+  target_link_directories(PkgConfig::FFMPEG INTERFACE "${PROJECT_SOURCE_DIR}/ffmpeg/lib")
+  target_link_libraries(PkgConfig::FFMPEG INTERFACE avcodec avformat avutil swscale swresample)
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+    libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+  if(NINFER_BUILD_MEDIA_ACQUIRE)
+    pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+  endif()
+endif()
+find_package(Threads REQUIRED)
+
+if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  # Product operational logging is an offline, repository-pinned dependency. Core-only builds do
+  # not configure or link it.
+  add_subdirectory(third_party/spdlog)
+endif()
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)

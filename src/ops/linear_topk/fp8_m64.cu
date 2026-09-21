@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"

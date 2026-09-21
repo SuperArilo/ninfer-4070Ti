@@ -67,10 +67,6 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 }
 
 ReasoningEffort parse_reasoning_effort(std::string_view text) {
-    if (text == "none") { return ReasoningEffort::None; }
-    if (text == "minimal") { return ReasoningEffort::Minimal; }
-    if (text == "high") { return ReasoningEffort::High; }
-    if (text == "max") { return ReasoningEffort::Max; }
     if (text == "low") { return ReasoningEffort::Low; }
     if (text == "medium") { return ReasoningEffort::Medium; }
     if (text == "xhigh") { return ReasoningEffort::XHigh; }
@@ -90,16 +86,17 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--chat-template FILE]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
-           "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
-           "       [--no-cuda-graph]\n"
+           "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
+           "       [--no-cuda-graph] [--wddm-evictable-budget]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
+           "--wddm-evictable-budget budgets runtime memory against total VRAM on dedicated "
+           "GPUs, ignoring the WDDM process budget (Windows only).\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
            "--kv-capacity auto leaves " +
@@ -128,8 +125,6 @@ Options parse_options(int argc, char** argv) {
 
         if (arg == "--prompt") {
             options.prompt = value(arg);
-        } else if (arg == "--chat-template") {
-            options.chat_template_path = value(arg);
         } else if (arg == "--messages") {
             options.messages_path = value(arg);
         } else if (arg == "--max-new") {
@@ -165,6 +160,8 @@ Options parse_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--wddm-evictable-budget") {
+            options.wddm_evictable_budget = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -224,12 +221,10 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::validate_speculative_cli_options(options.speculative);
-    if (options.enable_thinking == false && options.reasoning_effort &&
-        *options.reasoning_effort != ReasoningEffort::None) {
+    if (!options.enable_thinking && options.reasoning_effort) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
     }
-    if (options.reasoning_effort == ReasoningEffort::None) options.enable_thinking = false;
-    if (options.enable_thinking == false && options.thinking_budget) {
+    if (!options.enable_thinking && options.thinking_budget) {
         throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking");
     }
     if (options.greedy) { options.sampling.temperature = 0.0F; }

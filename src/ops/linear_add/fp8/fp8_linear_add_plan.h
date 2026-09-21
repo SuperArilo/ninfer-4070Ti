@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
@@ -11,8 +10,6 @@
 #include <cstdint>
 
 namespace ninfer::ops::detail {
-
-inline constexpr std::int32_t kFp8LinearAddChunkTokens = 24;
 
 [[nodiscard]] std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
                                                                   std::int32_t input_rows,

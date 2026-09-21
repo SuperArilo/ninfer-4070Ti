@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 
 #include "core/device.h"
@@ -14,8 +13,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry = Fp8N34816K5120;
-using Schedule = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+using Geometry = Fp8MlpGateUpGeometry;
+using Schedule = typename Fp8LinearDecodeProductionSchedule<Geometry>::Type;
 
 constexpr int kIntermediate = Geometry::kOutputRows / 2;
 static_assert(Schedule::kRowsPerWarp == 2);

@@ -71,37 +71,32 @@ only for NInfer; it is not a Transformers checkpoint, Safetensors distribution, 
 | Field | Value |
 |---|---|
 | Filename | `qwen3_6_27b.ninfer` |
-| Size | 17,495,538,688 bytes (16.29 GiB) |
-| SHA-256 | `9b610a7d051e7c4dbf89adb604bd269d248b643c8f6c7ef75bdb871af92c6f6b` |
-| Container version | 3 |
-| Architecture | `Qwen3_5ForCausalLM` |
-| Public model name | `qwen3.6-27b` |
-| Chat template | [qwen3_6.jinja](https://github.com/Neroued/ninfer/blob/98dada0e03cb073fd07f905400b5904bc6e82759/tools/chat_templates/qwen3_6.jinja); override with `--chat-template FILE` |
-| Template defaults | thinking on; closed-turn reasoning omitted |
+| Size | 17,495,365,888 bytes (16.29 GiB) |
+| SHA-256 | `7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b` |
+| Container version | 2 |
+| NInfer model ID | `qwen3.6-27b` |
+| NInfer weights ID | `groupwise-int` |
+| NInfer target key | `qwen3_6_27b` |
 
-The file contains Text, Vision, MTP, the optimized proposal head, and frontend resources. Text
-projections use Q4/Q5, vocabulary weights use Q6, and MTP projections use Q8. Vision and speculative
-weights are loaded only when selected at startup.
+The file contains the registered Text, Vision, MTP, proposal-head, tokenizer, chat-template,
+generation, and media-processor objects required by NInfer.
 
 Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  '9b610a7d051e7c4dbf89adb604bd269d248b643c8f6c7ef75bdb871af92c6f6b' \
+  '7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b' \
   'qwen3_6_27b.ninfer' | sha256sum --check
 ```
 
 ## Requirements
 
 - [NInfer](https://github.com/Neroued/ninfer) revision
-  [`98dada0`](https://github.com/Neroued/ninfer/commit/98dada0e03cb073fd07f905400b5904bc6e82759)
+  [`bd265a3`](https://github.com/Neroued/ninfer/commit/bd265a36fe990475bae143d2073d6a6cf67d0da3)
   or later, built from source;
 - 64-bit Linux;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
 - CUDA Toolkit 13.1 or newer.
-
-Already have the official v2 file? [Upgrade it locally](https://github.com/Neroued/ninfer/blob/master/docs/weight-conversion.md#upgrade-an-existing-v2-artifact)
-without downloading the weights again.
 
 NInfer does not provide an install target or packaged binary. See the
 [repository README](https://github.com/Neroued/ninfer#quick-start) for source-build dependencies.
@@ -159,7 +154,7 @@ The artifact supports:
 - text generation in thinking and non-thinking modes;
 - image, multi-image, video, and mixed multimodal messages;
 - MTP speculative decoding with draft windows from one to five;
-- BF16, INT8, FP8, NVFP4, and K8V4 KV cache;
+- row-scaled FP8 E4M3, INT8 group-64, and BF16 KV cache;
 - CUDA Graph decode and compatible-prefix reuse;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - the NInfer CLI;
@@ -171,7 +166,7 @@ The single-request serving measurements below were collected on an NVIDIA GeForc
 CUDA 13.1. Requests were submitted serially to a persistent `ninfer-serve` process with CUDA Graph
 enabled, a 1,024-token prefill chunk, INT8 group-64 KV cache, and prefix reuse disabled. Each
 single-request value is the arithmetic mean ± sample standard deviation over five fixed seeds;
-warm-up requests are excluded. These results use the `groupwise-int` recipe.
+warm-up requests are excluded. These results use `weights_id = groupwise-int`.
 
 ### Concurrent MTP=3 decode saturation
 
@@ -240,6 +235,8 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 ## Limits
 
+- The artifact is accepted only by NInfer revision `bd265a3` or later and the matching registered
+  target.
 - NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–8 active
   requests per Engine.
 - It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
@@ -253,14 +250,15 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 |---|---|
 | Source repository | `Qwen/Qwen3.6-27B` |
 | Source revision | `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9` |
-| Conversion recipe | `qwen3_6_27b` |
+| Conversion recipe | `qwen3_6_27b-v2` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
-| Minimum runtime revision | `98dada0e03cb073fd07f905400b5904bc6e82759` |
+| Converter revision | `d6319426e5ef08fa95c36e75cb3ab8b18e5fb957` |
+| Minimum runtime revision | `bd265a36fe990475bae143d2073d6a6cf67d0da3` |
 
 The artifact identity, summarized object inventory, and conversion provenance are published in
 [`artifact-manifest.json`](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/blob/main/artifact-manifest.json).
 The exact storage contract is maintained in the
-[v3 container reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/artifact-container.md).
+[Qwen3.6-27B artifact reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/qwen3.6-27b-artifact.md).
 
 ## License
 

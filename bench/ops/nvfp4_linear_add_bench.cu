@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 
 #include "core/device.h"

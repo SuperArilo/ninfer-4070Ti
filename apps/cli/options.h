@@ -15,7 +15,6 @@ struct Options {
     bool help_requested = false;
 
     std::filesystem::path artifact_path;
-    std::filesystem::path chat_template_path;
     std::string prompt;
     std::filesystem::path messages_path;
 
@@ -29,10 +28,12 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    // Opt-in aggressive WDDM memory budgeting against total VRAM on dedicated GPUs (Windows only).
+    bool wddm_evictable_budget = false;
 
     bool raw_output      = false;
     bool print_token_ids = false;
-    std::optional<bool> enable_thinking;
+    bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<ReasoningEffort> reasoning_effort;
 

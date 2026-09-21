@@ -1,13 +1,19 @@
-#include "core/weight.h"
+// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
+// This file differs from upstream NInfer; see patches/ in the release bundle
+// for the change list, rebuild steps and required verification.
 #include "ninfer/ops/linear.h"
 
+#include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
-#include "ops/linear/q8/q8_dispatch.h"
+#include "ops/linear/ternary/ternary_dispatch.h"
+#include "ops/linear/ternary/ternary_rotation.h"
+#include "ops/linear/w8/w8_dispatch.h"
 
 #include <cstdint>
 #include <limits>
@@ -77,29 +83,33 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
     switch (w.qtype) {
-    case QType::Q4_G64_FP16:
+    case QType::Q4G64_F16S:
         detail::q4_dispatch(x, w, out, policy, stream);
         return;
-    case QType::Q5_G64_FP16:
+    case QType::Q5G64_F16S:
         detail::q5_dispatch(x, w, out, policy, stream);
         return;
-    case QType::Q6_G64_FP16:
+    case QType::Q6G64_F16S:
         detail::q6_dispatch(x, w, out, policy, stream);
         return;
-    case QType::Q8_G32_FP16:
-        detail::q8_dispatch(x, w, out, policy, stream);
+    case QType::W8G32_F16S:
+        detail::w8_dispatch(x, w, out, policy, stream);
         return;
-    case QType::BF16:
+    case QType::BF16_CTRL:
         detail::bf16_dispatch(x, w, out, policy, stream);
         return;
     case QType::NVFP4:
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
-    case QType::FP8_E4M3FN_ROW_BF16:
+    case QType::FP8_E4M3FN_ROW_BF16S:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
-    case QType::FP32:
-    case QType::INT32:
+    case QType::PTQ1_0_G128:
+    case QType::PQ2_0_G128:
+        detail::ternary_dispatch(x, w, out, policy, workspace, stream);
+        return;
+    case QType::FP32_CTRL:
+    case QType::I32_CTRL:
         break;
     }
     throw std::invalid_argument("linear: unsupported weight qtype");
@@ -116,34 +126,48 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     }
 
     switch (qtype) {
-    case QType::Q4_G64_FP16:
+    case QType::Q4G64_F16S:
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
-    case QType::Q5_G64_FP16:
+    case QType::Q5G64_F16S:
         (void)detail::select_q5_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q5_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
-    case QType::Q6_G64_FP16:
+    case QType::Q6G64_F16S:
         (void)detail::select_q6_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q6_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
-    case QType::Q8_G32_FP16:
-        (void)detail::select_q8_launch(output_rows, input_rows, min_tokens, policy);
-        (void)detail::select_q8_launch(output_rows, input_rows, max_tokens, policy);
+    case QType::W8G32_F16S:
+        (void)detail::select_w8_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_w8_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
-    case QType::BF16:
+    case QType::BF16_CTRL:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
     case QType::NVFP4:
+        if (!detail::is_nvfp4_linear_problem(output_rows, input_rows) ||
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
+            throw std::invalid_argument("linear workspace: unsupported NVFP4 profile");
+        }
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                              min_tokens, max_tokens);
-    case QType::FP8_E4M3FN_ROW_BF16:
+    case QType::FP8_E4M3FN_ROW_BF16S:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
-    case QType::FP32:
-    case QType::INT32:
+    case QType::PTQ1_0_G128:
+    case QType::PQ2_0_G128:
+        // The GEMM itself decodes inside the kernel and needs no workspace, but the folded basis
+        // does: the activation must be mapped into the rotated basis (P, then signs, then the
+        // normalized Hadamard) before the matmul, and that needs a [K, T] BF16 scratch. Omitting
+        // these cases would make every ternary weight die here with "linear workspace:
+        // unsupported weight qtype" before reaching dispatch.
+        (void)detail::select_ternary_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_ternary_launch(output_rows, input_rows, max_tokens, policy);
+        return detail::ternary_rotation_workspace_bytes(input_rows, max_tokens);
+    case QType::FP32_CTRL:
+    case QType::I32_CTRL:
         break;
     }
     throw std::invalid_argument("linear workspace: unsupported weight qtype");

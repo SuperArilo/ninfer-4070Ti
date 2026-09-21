@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/weight.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"

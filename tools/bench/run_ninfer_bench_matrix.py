@@ -40,7 +40,7 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
-REPORT_SCHEMA_VERSION = 15
+REPORT_SCHEMA_VERSION = 14
 REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
 REPORT_TOOL = "ninfer_bench"
 
@@ -281,10 +281,8 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "n_prompt": test.get("n_prompt"),
             "n_gen": test.get("n_gen"),
             "requested_output_tokens": test.get("requested_output_tokens"),
-            "architecture": load.get("architecture"),
-            "model_name": load.get("name"),
-            "weight_formats": load.get("formats"),
-            "prefill_signature": load.get("prefill_signature"),
+            "target": load.get("target"),
+            "weights_id": load.get("weights_id"),
             "artifact_path": report.get("artifact", {}).get("path"),
             "max_context": config.get("max_context"),
             "kv_capacity": memory.get("kv_capacity"),
@@ -377,7 +375,7 @@ def write_manifest(
 ) -> None:
     manifest = {
         "artifact_type": "ninfer_bench_matrix_run",
-        "schema_version": 4,
+        "schema_version": 3,
         "created_at_utc": dt.datetime.now(dt.UTC).isoformat(),
         "preset": args.preset,
         "primary_mtp_draft_tokens": 3,

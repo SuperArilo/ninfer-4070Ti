@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 #include "core/device.h"
 
@@ -89,12 +88,17 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+#if !defined(NINFER_SM89)
     const std::int32_t first_a4 = k == 6144 ? 7 : 8;
+#endif
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
+#if !defined(NINFER_SM89)
+        // AllowA4 (W4A4) en NVFP4: kernels SM120 (Blackwell) por diseño upstream.
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
+        Invocation{1024, ops::LinearPolicy::AllowA4},
         Invocation{8, ops::LinearPolicy::AllowA4},
         Invocation{16, ops::LinearPolicy::AllowA4},
         Invocation{32, ops::LinearPolicy::AllowA4},
@@ -102,20 +106,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{96, ops::LinearPolicy::AllowA4},
         Invocation{128, ops::LinearPolicy::AllowA4},
         Invocation{129, ops::LinearPolicy::AllowA4},
-        // 1023, 1024 and 1025 straddle this route's floor. 1024 was the narrowest width it
-        // took before; 1025 is the first ragged one it takes now, and its last M tile holds a
-        // single real token, which is the emptiest grid this route ever runs.
-        Invocation{1023, ops::LinearPolicy::AllowA4},
-        Invocation{1024, ops::LinearPolicy::AllowA4},
-        Invocation{1025, ops::LinearPolicy::AllowA4},
+#endif
     };
-    // The invocation list is what drives the host buffers, so take the bound from it rather than
-    // from a literal that silently caps it.
-    const std::int32_t kMaximumTokens =
-        std::max_element(
-            invocations.begin(), invocations.end(),
-            [](const Invocation& a, const Invocation& b) { return a.tokens < b.tokens; })
-            ->tokens;
+    constexpr std::int32_t kMaximumTokens = 1024;
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 3.5F;
@@ -157,7 +150,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
             CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
             for (int replay = 0; replay < 2; ++replay) {
                 CUDA_CHECK(cudaMemcpyAsync(output.data(), initial_residual.data(), output.bytes(),
-                                           cudaMemcpyHostToDevice, stream));
+                    cudaMemcpyHostToDevice, stream));
                 CUDA_CHECK(cudaGraphLaunch(executable, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }

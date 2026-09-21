@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/weight.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -12,9 +11,7 @@ namespace ninfer::ops::detail {
 
 enum class Q4Q5GdnInputScheduleId {
     IndependentDirectFixed,
-    GroupedMixedMmaR32C32S2,
-    GroupedMixedMmaR32C64S4,
-    GroupedMixedMmaR64C128S2,
+    GroupedMixedMmaR64C128,
 };
 
 enum class Q4Q5GdnInputConvScheduleId {

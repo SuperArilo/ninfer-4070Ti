@@ -2,10 +2,9 @@
 
 #include "core/nvtx.h"
 #include "ninfer/types.h"
-#include "runtime/contract/execution.h"
-#include "runtime/contract/resources.h"
+#include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
-#include "runtime/engine/generation_budget.h"
+#include "runtime/generation/generation_budget.h"
 
 #include <atomic>
 #include <chrono>
@@ -103,13 +102,13 @@ enum class EngineRequestState : std::uint8_t {
     ModelFinished,
 };
 
-template <class ModelContract>
+template <class Package>
 struct RequestRecord {
     using Clock          = std::chrono::steady_clock;
-    using PreparedPrompt = typename ModelContract::PreparedPrompt;
-    using OutputSession  = typename ModelContract::OutputSession;
-    using BasePlan       = typename ModelContract::RequestBasePlan;
-    using SequenceHandle = typename ModelContract::SequenceHandle;
+    using PreparedPrompt = typename Package::PreparedPrompt;
+    using OutputSession  = typename Package::OutputSession;
+    using BasePlan       = typename Package::RequestBasePlan;
+    using SequenceHandle = typename Package::SequenceHandle;
     using StreamEvent    = std::variant<GenerationTimingObservation, OutputDelta>;
 
     RequestRecord(std::uint64_t request_identity, std::uint64_t publication_sequence,

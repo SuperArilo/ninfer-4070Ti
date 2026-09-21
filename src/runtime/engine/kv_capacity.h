@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime/contract/resources.h"
+#include "runtime/contract/types.h"
 
 #include <cstddef>
 

@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "core/device.h"
 #include "ops/linear/q5/q5_launch.h"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"

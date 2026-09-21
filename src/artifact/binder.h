@@ -1,68 +1,74 @@
+// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
+// This file differs from upstream NInfer; see patches/ in the release bundle
+// for the change list, rebuild steps and required verification.
 #pragma once
 
-#include "artifact/materializer.h"
 #include "artifact/reader.h"
 
-#include <optional>
+#include <cstddef>
+#include <cstdint>
 #include <span>
-#include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::artifact {
 
-enum class Residency { Device, Host, Values };
-
-struct ParameterReference {
-    std::string name;
-    Shape shape;
-    Binding binding;
-    Residency residency = Residency::Device;
+enum class TensorPlacement : std::uint8_t {
+    Device,
+    ValidateOnly,
 };
 
-struct HostValues {
-    QType format           = QType::FP32;
-    std::uint64_t elements = 0;
-    std::vector<std::byte> data;
-
-    [[nodiscard]] float scalar_f32() const;
-    [[nodiscard]] std::vector<std::int32_t> integers() const;
+struct ObjectHandle {
+    std::size_t index = 0;
 };
 
-// Collects selected logical demands; neither physical object IDs nor whole-artifact profiles
-// determine parameter shapes or native operation support.
+struct DeviceMaterialization {
+    ObjectHandle object;
+    std::uint64_t offset    = 0;
+    std::uint64_t bytes     = 0;
+    std::uint64_t alignment = 0;
+};
+
+struct HostMaterialization {
+    ObjectHandle object;
+};
+
+struct MaterializationPlan {
+    std::size_t object_count            = 0;
+    std::uint64_t device_capacity_bytes = 0;
+    std::vector<DeviceMaterialization> device_objects;
+    std::vector<HostMaterialization> host_objects;
+};
+
 class Binder {
 public:
     explicit Binder(const Reader& reader);
 
-    [[nodiscard]] ParameterReference parameter(std::string_view name, Shape shape,
-                                               Residency residency = Residency::Device,
-                                               std::optional<QType> exact_format = {});
-    [[nodiscard]] ParameterReference binding(std::string name, const Binding& binding, Shape shape,
-                                             Residency residency,
-                                             std::optional<QType> exact_format = {});
-    [[nodiscard]] const Use& use(std::string_view parameter, std::string_view input) const;
-    [[nodiscard]] bool contains(std::string_view parameter) const;
+    ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,
+                                std::span<const std::uint64_t> shape);
+    ObjectHandle require_resource(std::string_view name, ResourceEncoding encoding);
 
-    [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
-
-    void require_device(ObjectHandle object, std::uint64_t alignment = 256);
-    [[nodiscard]] std::span<const std::byte> host_object(ObjectHandle object);
-    [[nodiscard]] ObjectHandle resource(std::string_view component, std::string_view role);
-    [[nodiscard]] HostValues values(const Binding& binding, std::optional<QType> format = {});
-    [[nodiscard]] MaterializationPlan finish() &&;
+    [[nodiscard]] bool contains(std::string_view name) const noexcept;
+    // Peek an object's descriptor WITHOUT consuming it. bind_tensor()/require_tensor() consume
+    // and demand an expected format, so this is the only way to learn what an artifact really
+    // declares before binding it -- which grouped row-split weights need, because the family
+    // members are container-compatible and the artifact may store a different member than the
+    // caller's plan names.
+    [[nodiscard]] const ObjectDescriptor* find(std::string_view name) const noexcept;
+    const ObjectDescriptor& descriptor(ObjectHandle handle) const;
+    PayloadSpan payload(ObjectHandle handle) const;
+    void materialize_on_device(ObjectHandle handle);
+    void retain_on_host(ObjectHandle handle);
+    void validate_only(ObjectHandle handle);
+    MaterializationPlan finish();
 
 private:
-    struct Demand {
-        bool device             = false;
-        bool host               = false;
-        std::uint64_t alignment = 256;
-        std::vector<std::byte> host_data;
-    };
+    ObjectHandle find_unconsumed(std::string_view name);
 
     const Reader& reader_;
-    std::vector<Demand> demands_;
-    std::uint64_t read_bytes_        = 0;
-    std::uint64_t owned_value_bytes_ = 0;
+    std::vector<bool> consumed_;
+    std::vector<bool> planned_;
+    MaterializationPlan materialization_;
 };
 
 } // namespace ninfer::artifact

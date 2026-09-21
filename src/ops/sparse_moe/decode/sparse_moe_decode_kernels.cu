@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 
 #include "core/device.h"
@@ -9,7 +8,7 @@
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
-#include "ops/linear/q8/q8_rowsplit_storage.cuh"
+#include "ops/linear/w8/w8_rowsplit_storage.cuh"
 #include "ops/sparse_moe/sparse_moe_route.cuh"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
@@ -143,7 +142,7 @@ struct Q6Codec {
     }
 };
 
-struct Q8Codec {
+struct W8Codec {
     static constexpr int kGroupK                = 32;
     static constexpr bool kD3SingleValuePerLane = true;
     static constexpr bool kD3PackedWord8        = false;
@@ -161,7 +160,7 @@ struct Q8Codec {
     __device__ static __forceinline__ void
     load_pair(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
               std::int64_t group_index, int lane, float& w0, float& w1) {
-        Q8ScalarDecodeAtom::load_pair(codes, high, scales, group_index, lane, w0, w1);
+        W8ScalarDecodeAtom::load_pair(codes, high, scales, group_index, lane, w0, w1);
     }
 };
 
@@ -262,7 +261,7 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
                                            row_base + kIntermediate + j, x_shared, 0, kHidden, gate,
                                            up);
     } else {
-        dot_two_rows<Q8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
+        dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
                                        x_shared, 0, kHidden, gate, up);
     }
     if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = silu(gate) * up; }
@@ -275,8 +274,8 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
     const std::uint8_t* __restrict__ shared_scales, float* __restrict__ token_activations,
     int tokens, const int* __restrict__ adaptive_route_jobs) {
-    // Three path CTAs per token/output row expose enough blocks for the 170-SM target and keep the
-    // heavier shared Q8 path from holding eight completed routed warps resident.
+    // Three path CTAs per token/output row expose enough blocks to fill the device and keep the
+    // heavier shared W8 path from holding eight completed routed warps resident.
     static_assert(PathsPerBlock > 0 && (kTopK + 1) % PathsPerBlock == 0);
     constexpr int kPathBlocks = (kTopK + 1) / PathsPerBlock;
     __shared__ __align__(16) __nv_bfloat16 x_shared[kHidden];
@@ -321,7 +320,7 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
                                                row_base + j, row_base + kIntermediate + j, x_shared,
                                                0, kHidden, gate, up);
         } else {
-            dot_two_rows<Q8Codec, kHidden>(shared_codes, nullptr, shared_scales, j,
+            dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j,
                                            kIntermediate + j, x_shared, 0, kHidden, gate, up);
         }
         if (lane == 0) {
@@ -410,9 +409,9 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
         }
     } else {
         float dot[Rows];
-        dot_fp32_rows<Q8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
+        dot_fp32_rows<W8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
                                      act + static_cast<std::int64_t>(kTopK) * kIntermediate, 0,
-                                     kIntermediate / Q8Codec::kGroupK, dot);
+                                     kIntermediate / W8Codec::kGroupK, dot);
         if (lane == 0) {
 #pragma unroll
             for (int row = 0; row < Rows; ++row) { paths[kTopK][row] = *shared_scale * dot[row]; }
@@ -480,9 +479,9 @@ __global__ void sparse_moe_d4_token_kernel(
             }
         } else {
             float dot[Rows];
-            dot_fp32_rows<Q8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
+            dot_fp32_rows<W8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
                                          act + static_cast<std::int64_t>(kTopK) * kIntermediate, 0,
-                                         kIntermediate / Q8Codec::kGroupK, dot);
+                                         kIntermediate / W8Codec::kGroupK, dot);
             if (lane == 0) {
 #pragma unroll
                 for (int row = 0; row < Rows; ++row) {
@@ -540,11 +539,11 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
     CUDA_CHECK(cudaGetLastError());
 
     switch (weights.routed_gate_up.qtype) {
-    case QType::Q4_G64_FP16:
+    case QType::Q4G64_F16S:
         launch_d3_dependent_codec<Q4Codec>(x, weights, workspace, stream);
         return;
-    case QType::Q8_G32_FP16:
-        launch_d3_dependent_codec<Q8Codec>(x, weights, workspace, stream);
+    case QType::W8G32_F16S:
+        launch_d3_dependent_codec<W8Codec>(x, weights, workspace, stream);
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D3 codec");
@@ -576,16 +575,16 @@ void launch_d4_dependent(const SparseMoeWeights& weights, Tensor& destination,
                          const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
                          const void* prefetch_data, std::size_t prefetch_bytes) {
     switch (weights.routed_down.qtype) {
-    case QType::Q5_G64_FP16:
+    case QType::Q5G64_F16S:
         launch_d4_dependent_codec<Q5Codec>(weights, destination, workspace, stream, prefetch_data,
                                            prefetch_bytes);
         return;
-    case QType::Q6_G64_FP16:
+    case QType::Q6G64_F16S:
         launch_d4_dependent_codec<Q6Codec>(weights, destination, workspace, stream, prefetch_data,
                                            prefetch_bytes);
         return;
-    case QType::Q8_G32_FP16:
-        launch_d4_dependent_codec<Q8Codec>(weights, destination, workspace, stream, prefetch_data,
+    case QType::W8G32_F16S:
+        launch_d4_dependent_codec<W8Codec>(weights, destination, workspace, stream, prefetch_data,
                                            prefetch_bytes);
         return;
     default:
@@ -692,7 +691,7 @@ void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights
                                          std::int32_t tokens, SparseMoeSmallTD3Schedule schedule,
                                          cudaStream_t stream, const int* adaptive_route_jobs) {
     switch (weights.routed_gate_up.qtype) {
-    case QType::Q4_G64_FP16:
+    case QType::Q4G64_F16S:
         if (adaptive_route_jobs == nullptr) {
             launch_d3_small_t_codec<Q4Codec, false>(x, weights, token_ids, token_activations,
                                                     tokens, schedule, stream, nullptr);
@@ -701,8 +700,8 @@ void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights
                                                    schedule, stream, adaptive_route_jobs);
         }
         return;
-    case QType::Q8_G32_FP16:
-        launch_d3_small_t_codec<Q8Codec, false>(x, weights, token_ids, token_activations, tokens,
+    case QType::W8G32_F16S:
+        launch_d3_small_t_codec<W8Codec, false>(x, weights, token_ids, token_activations, tokens,
                                                 schedule, stream, nullptr);
         return;
     default:
@@ -716,7 +715,7 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
                                          std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
                                          cudaStream_t stream, const int* adaptive_route_jobs) {
     switch (weights.routed_down.qtype) {
-    case QType::Q5_G64_FP16:
+    case QType::Q5G64_F16S:
         if (adaptive_route_jobs == nullptr) {
             launch_d4_small_t_codec<Q5Codec, false>(weights, destination, token_ids, token_alpha,
                                                     shared_scale, token_activations, tokens,
@@ -727,7 +726,7 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
                                                    schedule, stream, adaptive_route_jobs);
         }
         return;
-    case QType::Q6_G64_FP16:
+    case QType::Q6G64_F16S:
         if (adaptive_route_jobs == nullptr) {
             launch_d4_small_t_codec<Q6Codec, false>(weights, destination, token_ids, token_alpha,
                                                     shared_scale, token_activations, tokens,
@@ -738,8 +737,8 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
                                                    schedule, stream, adaptive_route_jobs);
         }
         return;
-    case QType::Q8_G32_FP16:
-        launch_d4_small_t_codec<Q8Codec, false>(weights, destination, token_ids, token_alpha,
+    case QType::W8G32_F16S:
+        launch_d4_small_t_codec<W8Codec, false>(weights, destination, token_ids, token_alpha,
                                                 shared_scale, token_activations, tokens, schedule,
                                                 stream, nullptr);
         return;

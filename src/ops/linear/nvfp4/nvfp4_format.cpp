@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
 #include <cmath>

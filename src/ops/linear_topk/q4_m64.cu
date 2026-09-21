@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
@@ -8,7 +7,6 @@
 #include "ops/linear_topk/linear_topk_workspace.h"
 
 #include <cub/warp/warp_merge_sort.cuh>
-#include <cuda_bf16.h>
 
 #include <cstdint>
 #include <stdexcept>

@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 
 #include "core/device.h"
@@ -10,9 +9,8 @@ namespace ninfer::ops::detail {
 
 void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                    cudaStream_t stream) {
-    using Geometry = Nvfp4N16384K5120;
-    using Schedule =
-        Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+    using Geometry = Nvfp4GdnInputGeometry;
+    using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;

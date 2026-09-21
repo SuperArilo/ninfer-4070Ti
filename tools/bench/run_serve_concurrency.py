@@ -45,7 +45,7 @@ SATURATION_SEEDS = (
 CORPUS_ORDER_SEED = 20260811
 POINT_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_point"
 SUMMARY_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_summary"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,7 +63,7 @@ class Point:
     @property
     def key(self) -> str:
         return (
-            f"{corpus.filename_label(self.target)}_{self.speculative_mode}_{self.sampling_mode}_"
+            f"{self.target}_{self.speculative_mode}_{self.sampling_mode}_"
             f"{self.suite.replace('-', '_')}_c{self.concurrency}"
         )
 
@@ -103,8 +103,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--artifact",
         action="append",
         required=True,
-        metavar="LABEL=PATH",
-        help="artifact label and server model alias; repeat to benchmark multiple instances",
+        metavar="TARGET=PATH",
+        help="artifact for a registered target; repeat to benchmark multiple targets",
     )
     parser.add_argument(
         "--mode",
@@ -145,6 +145,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="262144",
         metavar="N|auto",
         help="shared Main KV capacity passed to ninfer-serve (default: 262144)",
+    )
+    parser.add_argument(
+        "--kv-dtype",
+        default="int8",
+        help="KV cache dtype passed to ninfer-serve (default: int8, as in the "
+        "upstream Linux campaign commands; rk4v4-e8 is the documented Windows "
+        "fallback when the int8 context does not fit the 24 GB card)",
     )
     parser.add_argument("--prefill-chunk", type=int, default=1024)
     parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
@@ -192,12 +199,16 @@ def build_points(
     for target, artifact in artifacts:
         for mode_name in mode_names:
             backend, draft_tokens = corpus.SPECULATIVE_MODES[mode_name]
+            if backend == "dflash" and target != "qwen3_6_35b_a3b":
+                raise corpus.CampaignError("DFlash measurements require the 35B-A3B target")
+            if backend == "dflash2" and target != "qwen3_8_27b":
+                raise corpus.CampaignError("DFlash2 measurements require Qwen3.8-27B")
             for suite in args.suite:
                 for concurrency in args.concurrency:
                     points.append(
                         Point(
                             target=target,
-                            model_id=target,
+                            model_id=corpus.TARGET_MODEL_IDS[target],
                             artifact=artifact,
                             speculative_mode=mode_name,
                             speculative_backend=backend,
@@ -305,8 +316,13 @@ def server_command(
         "--request-log-jsonl",
         str(server_log),
         "--kv-dtype",
-        "int8",
+        args.kv_dtype,
         "--no-prefix-reuse",
+        # Windows (WDDM) only: residency lock over the evictable VRAM budget so
+        # large-context points are not evicted from VRAM. Upstream Linux runs
+        # have no WDDM and no equivalent flag; every Windows campaign run
+        # carries it (documented in the campaign results).
+        "--wddm-evictable-budget",
     ]
     if point.speculative_backend != "none":
         command.extend(
@@ -355,7 +371,7 @@ def validate_server_start(
         "pending_timeout_ms": PENDING_TIMEOUT_MS,
         "prefill_chunk": args.prefill_chunk,
         "log_stats_interval_ms": STATS_INTERVAL_MS,
-        "kv_cache": "int8-group64",
+        "kv_cache": corpus.canonical_kv_cache(args.kv_dtype),
         "cuda_graph": True,
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
@@ -369,18 +385,18 @@ def validate_server_start(
         point.sampling_mode == "greedy"
     ):
         raise corpus.CampaignError("server_start sampling mode does not match the point")
-    if Path(event.get("artifact", {}).get("path", "")).resolve() != point.artifact.resolve():
-        raise corpus.CampaignError("loaded artifact path does not match the point")
+    if event.get("artifact", {}).get("target") != point.target:
+        raise corpus.CampaignError("loaded artifact target does not match the point")
     if event.get("server", {}).get("public_model_id") != point.model_id:
         raise corpus.CampaignError("server public model id does not match the point")
 
     server_instance_id = event.get("server_instance_id")
-    prefill_signature = event.get("artifact", {}).get("prefill_signature")
+    weights_id = event.get("artifact", {}).get("weights_id")
     if not isinstance(server_instance_id, str) or not server_instance_id:
         raise corpus.CampaignError("server_start has no server_instance_id")
-    if not isinstance(prefill_signature, str) or not prefill_signature:
-        raise corpus.CampaignError("server_start has no canonical prefill_signature")
-    return server_instance_id, prefill_signature
+    if not isinstance(weights_id, str) or not weights_id:
+        raise corpus.CampaignError("server_start has no canonical weights_id")
+    return server_instance_id, weights_id
 
 
 def parse_client_response(
@@ -646,6 +662,107 @@ def steady_metrics(
     }
 
 
+def decode_tail_check(
+    throughput_events: Sequence[dict[str, Any]],
+    committed_decode_tokens: int,
+    request_done_decode_tokens: int,
+) -> dict[str, int | float] | None:
+    """Validate the throughput/request_done decode token totals.
+
+    On POSIX, Popen.terminate() is SIGTERM: the server stops gracefully and
+    flushes its final partial stats interval (the "tail") to the request log,
+    so the totals match exactly. On Windows, terminate() is TerminateProcess:
+    the tail is never written and the totals are short by exactly the decode
+    committed after the last stats tick. The shortfall is then bounded by the
+    peak per-second decode commitment of any observed interval (one stats
+    interval of 1000 ms, +1% cadence slack); a larger shortfall is a real
+    inconsistency and raises. Returns the tail record for the report (None
+    when the totals match exactly).
+    """
+    if committed_decode_tokens == request_done_decode_tokens:
+        return None
+    if committed_decode_tokens > request_done_decode_tokens:
+        raise corpus.CampaignError("throughput and request_done decode token totals differ")
+    if os.name != "nt":
+        raise corpus.CampaignError("throughput and request_done decode token totals differ")
+    rates = [
+        int(event["tokens"]["committed_decode"]) / float(event["interval_seconds"])
+        for event in throughput_events
+        if float(event.get("interval_seconds", 0.0)) > 0.0
+    ]
+    if not rates:
+        raise corpus.CampaignError(
+            "decode totals differ with no stats interval available to bound the tail"
+        )
+    bound = 1.01 * max(rates)
+    shortfall = request_done_decode_tokens - committed_decode_tokens
+    if shortfall > bound:
+        raise corpus.CampaignError(
+            "throughput decode total shortfall exceeds one stats interval: "
+            f"committed={committed_decode_tokens} done={request_done_decode_tokens} "
+            f"bound={bound:.0f}"
+        )
+    return {
+        "committed_decode_tokens": committed_decode_tokens,
+        "request_done_decode_tokens": request_done_decode_tokens,
+        "missing_tail_tokens": shortfall,
+        "peak_decode_tokens_per_second": max(rates),
+    }
+
+
+def prefill_tail_check(
+    throughput_events: Sequence[dict[str, Any]],
+    committed_prefill_tokens: int,
+    request_done_prefill_tokens: int,
+) -> dict[str, int | float] | None:
+    """Validate the throughput/request_done prefill token totals.
+
+    Same Windows tail-loss mechanism as decode_tail_check: the server is
+    hard-killed (TerminateProcess) right after the last response, so the
+    stats reporter never emits its final partial interval. Prefill tokens
+    committed in that unemitted tail are missing from the throughput sum
+    while every request_done reports its full computed prefill. The shortfall
+    is bounded by the largest single-interval prefill of any observed
+    throughput event (one 1000 ms stats interval of prefill, +1% cadence
+    slack); a larger shortfall is a real inconsistency and raises. Returns
+    the tail record for the report (None when the totals match exactly).
+    POSIX stays strict.
+    """
+    if committed_prefill_tokens == request_done_prefill_tokens:
+        return None
+    if committed_prefill_tokens > request_done_prefill_tokens:
+        raise corpus.CampaignError(
+            "throughput and request_done prefill token totals differ"
+        )
+    if os.name != "nt":
+        raise corpus.CampaignError(
+            "throughput and request_done prefill token totals differ"
+        )
+    peaks = [
+        int(event["tokens"]["computed_prefill"])
+        for event in throughput_events
+        if float(event.get("interval_seconds", 0.0)) > 0.0
+    ]
+    if not peaks:
+        raise corpus.CampaignError(
+            "prefill totals differ with no stats interval available to bound the tail"
+        )
+    bound = 1.01 * max(peaks)
+    shortfall = request_done_prefill_tokens - committed_prefill_tokens
+    if shortfall > bound:
+        raise corpus.CampaignError(
+            "throughput prefill total shortfall exceeds one stats interval: "
+            f"committed={committed_prefill_tokens} "
+            f"done={request_done_prefill_tokens} bound={bound:.0f}"
+        )
+    return {
+        "committed_prefill_tokens": committed_prefill_tokens,
+        "request_done_prefill_tokens": request_done_prefill_tokens,
+        "missing_tail_tokens": shortfall,
+        "peak_interval_prefill_tokens": max(peaks),
+    }
+
+
 def client_records(
     results: Sequence[ClientResult], campaign_start: float
 ) -> list[dict[str, Any]]:
@@ -672,7 +789,7 @@ def analyze_point(
     command: Sequence[str],
     server_log: Path,
     server_start: dict[str, Any],
-    prefill_signature: str,
+    weights_id: str,
     events: Sequence[dict[str, Any]],
     results: Sequence[ClientResult],
     campaign_start: float,
@@ -697,10 +814,16 @@ def analyze_point(
         "completion_tokens"
     ]:
         raise corpus.CampaignError("client usage and request_done token totals differ")
-    if runtime_totals["computed_prefill_tokens"] != done_totals["computed_prefill_tokens"]:
-        raise corpus.CampaignError("throughput and request_done prefill token totals differ")
-    if runtime_totals["committed_decode_tokens"] != done_totals["decode_tokens"]:
-        raise corpus.CampaignError("throughput and request_done decode token totals differ")
+    prefill_tail = prefill_tail_check(
+        throughput,
+        runtime_totals["computed_prefill_tokens"],
+        done_totals["computed_prefill_tokens"],
+    )
+    decode_tail = decode_tail_check(
+        throughput,
+        runtime_totals["committed_decode_tokens"],
+        done_totals["decode_tokens"],
+    )
 
     makespan = campaign_end - campaign_start
     if makespan <= 0.0:
@@ -732,7 +855,7 @@ def analyze_point(
         "artifact_type": POINT_ARTIFACT_TYPE,
         "schema_version": SCHEMA_VERSION,
         "target": point.target,
-        "prefill_signature": prefill_signature,
+        "weights_id": weights_id,
         "model": point.model_id,
         "artifact_path": str(point.artifact),
         "speculative_mode": point.speculative_mode,
@@ -749,6 +872,8 @@ def analyze_point(
         "memory": server_start.get("memory", {}),
         "environment": server_start.get("environment", {}),
         "totals": done_totals,
+        "decode_tail": decode_tail,
+        "prefill_tail": prefill_tail,
         "decode_batch": {
             "rounds": runtime_totals["decode_rounds"],
             "row_rounds": runtime_totals["decode_row_rounds"],
@@ -777,7 +902,7 @@ def run_point(
 
     with corpus.RunningServer(command, "127.0.0.1", args.port, server_log) as server:
         server_start = server.wait_until_ready()
-        server_instance_id, prefill_signature = validate_server_start(server_start, point, args)
+        server_instance_id, weights_id = validate_server_start(server_start, point, args)
         if point.suite == "corpus-makespan" and point.concurrency == 1:
             # Persist full responses and the existing per-request metrics off the HTTP send path.
             # C=1 gives one unambiguous request_done sequence; the measured end is still the final
@@ -804,7 +929,7 @@ def run_point(
                         seed=job.seed,
                     )
                     record = corpus.build_result_record(
-                        spec, prefill_signature, request_payload(point, job), response, event
+                        spec, weights_id, request_payload(point, job), response, event
                     )
                     corpus.append_record(handle, record)
                     records[corpus.record_key(record)] = record
@@ -840,7 +965,7 @@ def run_point(
         command,
         server_log,
         server_start,
-        prefill_signature,
+        weights_id,
         events,
         results,
         campaign_start,
@@ -870,7 +995,7 @@ def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
     for report in reports:
         key = (
             str(report["target"]),
-            str(report["prefill_signature"]),
+            str(report["weights_id"]),
             str(report["speculative_mode"]),
             str(report["sampling_mode"]),
             str(report["suite"]),
@@ -881,7 +1006,7 @@ def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
     for report in reports:
         key = (
             str(report["target"]),
-            str(report["prefill_signature"]),
+            str(report["weights_id"]),
             str(report["speculative_mode"]),
             str(report["sampling_mode"]),
             str(report["suite"]),
@@ -902,7 +1027,7 @@ def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
 SUMMARY_FIELDS = (
     "suite",
     "target",
-    "prefill_signature",
+    "weights_id",
     "speculative_mode",
     "sampling_mode",
     "corpus_order_seed",
@@ -926,7 +1051,7 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
     row = {
         "suite": report["suite"],
         "target": report["target"],
-        "prefill_signature": report["prefill_signature"],
+        "weights_id": report["weights_id"],
         "speculative_mode": report["speculative_mode"],
         "sampling_mode": report["sampling_mode"],
         "corpus_order_seed": report.get("workload_order", {}).get("seed"),
@@ -1006,16 +1131,16 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
     for row in rows:
         key = (
             str(row["target"]),
-            str(row["prefill_signature"]),
+            str(row["weights_id"]),
             str(row["speculative_mode"]),
             str(row["suite"]),
         )
         groups.setdefault(key, []).append(row)
 
     sections: list[str] = []
-    for (target, prefill_signature, mode, suite), group in groups.items():
+    for (target, weights_id, mode, suite), group in groups.items():
         group.sort(key=lambda row: int(row["concurrency"]))
-        title = f"## {target} / {prefill_signature} / {mode} / {suite}"
+        title = f"## {target} / {weights_id} / {mode} / {suite}"
         if suite == "decode-saturation":
             table = markdown_table(
                 ("C", "Requests", "Steady s", "Avg batch", "Decode tok/s", "Speedup"),

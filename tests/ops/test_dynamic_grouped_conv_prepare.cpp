@@ -1,4 +1,3 @@
-#include "core/weight.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "core/decode_graph.h"
 
