@@ -43,7 +43,30 @@ class Fp8RowFormat:
     name: str
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat
+@dataclass(frozen=True, slots=True)
+class TernaryFormat:
+    """Prism ternary codes: grouped {-1,0,+1} codes with one binary16 scale per group.
+
+    ⚠️ NOT part of upstream NInfer — reconstructed for the ternary Bonsai port.
+    The released bundle ships pack.py (which names these formats) and the C++ side
+    of the artifact layer, but NOT the matching Python-side registration, so
+    `get_format("PQ2_0_G128")` raises "unknown numeric format" on a clean tree.
+
+    Why the existing QuantFormat cannot express them: `row_split_geometry` derives
+    `base_bytes_per_group` as `group_size // 2` (for bits != 8), giving 64 for a
+    128-wide group.  PQ2_0 actually stores **32** base bytes per group and PTQ1_0
+    stores **24 base + 2 high**.  So the per-group byte counts are stated explicitly.
+    """
+
+    name: str
+    group_size: int
+    base_bytes_per_group: int
+    high_bytes_per_group: int
+
+
+NumericFormat: TypeAlias = (
+    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | TernaryFormat
+)
 
 
 BF16 = DirectFormat("BF16", 2)
@@ -56,6 +79,12 @@ Q6G64_F16S = QuantFormat("Q6G64_F16S", 6, 64, -32, 31)
 W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("NVFP4", 16)
 FP8_E4M3FN_ROW_BF16S = Fp8RowFormat("FP8_E4M3FN_ROW_BF16S")
+
+# Ternary Bonsai formats (see TernaryFormat docstring).  Byte counts per 128-weight
+# group, verified against the sizes recorded in docs/03-三元模型转-NInfer.md §1.1:
+#   [248320, 5120] -> PTQ1_0 278,118,400 B / PQ2_0 337,715,200 B
+PQ2_0_G128 = TernaryFormat("PQ2_0_G128", 128, 32, 0)
+PTQ1_0_G128 = TernaryFormat("PTQ1_0_G128", 128, 24, 2)
 
 
 DIRECT_FORMATS = MappingProxyType(
@@ -71,8 +100,17 @@ NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType(
     {FP8_E4M3FN_ROW_BF16S.name: FP8_E4M3FN_ROW_BF16S}
 )
+TERNARY_FORMATS = MappingProxyType(
+    {item.name: item for item in (PQ2_0_G128, PTQ1_0_G128)}
+)
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS}
+    {
+        **DIRECT_FORMATS,
+        **QUANT_FORMATS,
+        **NVFP4_FORMATS,
+        **FP8_ROW_FORMATS,
+        **TERNARY_FORMATS,
+    }
 )
 
 

@@ -24,6 +24,7 @@ from .numeric import (
     Nvfp4Format,
     NumericFormat,
     QuantFormat,
+    TernaryFormat,
     get_format,
     valid_positive_fp32_word,
 )
@@ -104,7 +105,17 @@ CONTIGUOUS_LE_V1 = Layout(
 ROW_SPLIT_K128_V1 = Layout(
     "row-split-k128-v1",
     256,
-    frozenset(("Q4G64_F16S", "Q5G64_F16S", "Q6G64_F16S", "W8G32_F16S")),
+    frozenset(
+        (
+            "Q4G64_F16S",
+            "Q5G64_F16S",
+            "Q6G64_F16S",
+            "W8G32_F16S",
+            # Ternary Bonsai (reconstructed — see numeric.TernaryFormat)
+            "PQ2_0_G128",
+            "PTQ1_0_G128",
+        )
+    ),
 )
 BLOCKSCALE_K16_M128X4_V1 = Layout(
     "blockscale-k16-m128x4-v1",
@@ -180,18 +191,28 @@ def _shape(value: Sequence[int], *, rank: int | None = None) -> tuple[int, ...]:
 
 
 def row_split_geometry(
-    format: str | QuantFormat, shape: Sequence[int]
+    format: str | QuantFormat | TernaryFormat, shape: Sequence[int]
 ) -> RowSplitGeometry:
     spec = _format(format)
-    if not isinstance(spec, QuantFormat):
-        raise ValueError("row-split-k128-v1 requires a grouped quantized format")
     n, k = _shape(shape, rank=2)
     k_pad = align_up(k, K_ALIGNMENT)
-    groups_per_row = k_pad // spec.group_size
-    base_bytes_per_group = spec.group_size if spec.bits == 8 else spec.group_size // 2
-    high_bytes_per_group = (
-        0 if spec.bits in (4, 8) else spec.group_size * (spec.bits - 4) // 8
-    )
+    if isinstance(spec, TernaryFormat):
+        # Reconstructed path: ternary codes state their per-group byte counts explicitly,
+        # because the QuantFormat formula below (group_size // 2 for bits != 8) yields 64
+        # for a 128-group while PQ2_0 stores 32 and PTQ1_0 stores 24 base + 2 high.
+        groups_per_row = k_pad // spec.group_size
+        base_bytes_per_group = spec.base_bytes_per_group
+        high_bytes_per_group = spec.high_bytes_per_group
+    elif isinstance(spec, QuantFormat):
+        groups_per_row = k_pad // spec.group_size
+        base_bytes_per_group = (
+            spec.group_size if spec.bits == 8 else spec.group_size // 2
+        )
+        high_bytes_per_group = (
+            0 if spec.bits in (4, 8) else spec.group_size * (spec.bits - 4) // 8
+        )
+    else:
+        raise ValueError("row-split-k128-v1 requires a grouped quantized format")
     base_row_bytes = groups_per_row * base_bytes_per_group
     high_row_bytes = groups_per_row * high_bytes_per_group
     scale_row_bytes = groups_per_row * 2
@@ -288,7 +309,7 @@ def encoded_size(
             raise ValueError("contiguous-le-v1 supports rank 0 through 16")
         return prod(dims) * numeric_spec.word_bytes
     if layout_spec is ROW_SPLIT_K128_V1:
-        if not isinstance(numeric_spec, QuantFormat):
+        if not isinstance(numeric_spec, (QuantFormat, TernaryFormat)):
             raise ValueError("row-split-k128-v1 requires a grouped quantized format")
         return row_split_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is BLOCKSCALE_K16_M128X4_V1:
