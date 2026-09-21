@@ -362,7 +362,9 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
         // exceed the 64K per-SM register file and admit one resident CTA. Clamp against the
         // driver's true occupancy so the cooperative grid never exceeds SMs * maxBlocksPerSM
         // (larger problems fall into the chunked path below, which needs no cross-tile reduction).
-        static const std::int32_t kResidentCtasPerSm = [] {
+        // GCC requires this capture: std::min binds its arg by const&, which odr-uses the
+        // enclosing constexpr (MSVC accepted it without the capture).
+        static const std::int32_t kResidentCtasPerSm = [kTunedResidentCtasPerSm] {
             int full_blocks       = 0;
             int predicated_blocks = 0;
             (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(

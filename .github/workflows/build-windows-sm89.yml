@@ -78,7 +78,7 @@ jobs:
 
     - name: Build
       shell: pwsh
-      run: cmake --build build --config Release -j 8
+      run: cmake --build build --config Release -j 8 -- -k 0
 
     - name: Stage binaries
       if: always()
