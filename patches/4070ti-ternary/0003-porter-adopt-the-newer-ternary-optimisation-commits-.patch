@@ -1,0 +1,1903 @@
+From e7f6d81a6112682362797be0af8f878ddca57b43 Mon Sep 17 00:00:00 2001
+From: SuperArilo <superarilo@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 09:16:44 +0800
+Subject: [PATCH 3/3] porter: adopt the newer ternary optimisation commits from
+ CraneBW/ninfer-ternary-bonsai-ada (same Ambolio v1.0.8 base).\n\nAdopted (10
+ modified + 1 new):\n- src/ops/linear/ternary/: rotation, gemm, gemv, small-T
+ tensor-core paths, new ternary_rowsplit_mma.cuh\n-
+ src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu: explicit lambda
+ capture of\n  kTunedResidentCtasPerSm. VS 18 (MSVC 14.51) rejects the
+ implicit capture with C3493, which is\n  what broke the previous run; the
+ porter added the capture for GCC and it fixes MSVC too.\n-
+ src/ops/linear_attention/gated_delta_net/recurrent.{cu,cuh},
+ src/ops/linear_topk/q4_m64.cu\n\nCI: build step now passes '-k 0' to ninja so
+ one run reports every compile error instead of the first.
+
+---
+ .github/workflows/build-windows-sm89.yml      |   2 +-
+ .../bf16/bf16_gdn_gating_proj_kernels.cu      |   4 +-
+ src/ops/linear/ternary/ternary_rotation.cu    |  41 +-
+ .../ternary/ternary_rotation_kernels.cuh      |  15 +-
+ .../linear/ternary/ternary_rowsplit_gemm.cu   | 277 +++++++-
+ .../linear/ternary/ternary_rowsplit_gemm.cuh  |   6 +-
+ .../linear/ternary/ternary_rowsplit_gemv.cuh  | 160 +++++
+ .../linear/ternary/ternary_rowsplit_mma.cuh   | 402 +++++++++++
+ .../ternary/ternary_rowsplit_mma_small_t.cuh  | 665 +++++++++---------
+ .../gated_delta_net/recurrent.cu              |  19 +-
+ .../gated_delta_net/recurrent.cuh             |  25 +-
+ src/ops/linear_topk/q4_m64.cu                 |   1 +
+ 12 files changed, 1242 insertions(+), 375 deletions(-)
+ create mode 100644 src/ops/linear/ternary/ternary_rowsplit_mma.cuh
+
+diff --git a/.github/workflows/build-windows-sm89.yml b/.github/workflows/build-windows-sm89.yml
+index 49228e99..35095a59 100644
+--- a/.github/workflows/build-windows-sm89.yml
++++ b/.github/workflows/build-windows-sm89.yml
+@@ -78,7 +78,7 @@ jobs:
+ 
+     - name: Build
+       shell: pwsh
+-      run: cmake --build build --config Release -j 8
++      run: cmake --build build --config Release -j 8 -- -k 0
+ 
+     - name: Stage binaries
+       if: always()
+diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
+index 4f6440cd..650fa998 100644
+--- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
++++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
+@@ -362,7 +362,9 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+         // exceed the 64K per-SM register file and admit one resident CTA. Clamp against the
+         // driver's true occupancy so the cooperative grid never exceeds SMs * maxBlocksPerSM
+         // (larger problems fall into the chunked path below, which needs no cross-tile reduction).
+-        static const std::int32_t kResidentCtasPerSm = [] {
++        // GCC requires this capture: std::min binds its arg by const&, which odr-uses the
++        // enclosing constexpr (MSVC accepted it without the capture).
++        static const std::int32_t kResidentCtasPerSm = [kTunedResidentCtasPerSm] {
+             int full_blocks       = 0;
+             int predicated_blocks = 0;
+             (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+diff --git a/src/ops/linear/ternary/ternary_rotation.cu b/src/ops/linear/ternary/ternary_rotation.cu
+index cbf341a4..14180877 100644
+--- a/src/ops/linear/ternary/ternary_rotation.cu
++++ b/src/ops/linear/ternary/ternary_rotation.cu
+@@ -47,10 +47,30 @@ void require_rotation_operands(const Tensor& x, const Weight& weight, const char
+     }
+ }
+ 
+-unsigned rotation_grid(std::int32_t k, std::int32_t tokens) {
+-    const std::int64_t warps =
+-        static_cast<std::int64_t>(k / kBlockSize) * static_cast<std::int64_t>(tokens);
+-    return static_cast<unsigned>((warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
++// The transform is one warp per (1024-block, token) pair, so the grid is fixed by the data and
++// there is no tiling to do -- the only free parameter is how those warps are PACKED, and it is
++// worth measuring rather than assuming. A decode-shaped rotation (k=5120, T=3) is 15 warps: at 8
++// per block that is two blocks on two of the card's 66 SMs and costs 4.74 us, against 3.40 at one
++// warp per block. What is being paid is the latency of one warp's 32-load chain, not bandwidth --
++// the wpb=1 time is FLAT in k (17408 costs the same as 5120) and flat in block count (5, 15 and 51
++// blocks all measure 3.40 us), so spreading the warps over more SMs is free and packing them
++// together is not.
++//
++// The prefill regime is the opposite case: 5120 warps at one per block would sit on the
++// 32-blocks-per-SM resident limit instead of the 48-warp one, so a large grid keeps the original
++// packing. The threshold is where one block per SM stops covering the card.
++int rotation_warps_per_block(std::int64_t warps) {
++    static const int configured = [] {
++        const char* value = std::getenv("NINFER_TERNARY_ROTATE_WPB");
++        const int parsed  = value == nullptr ? 0 : std::atoi(value);
++        return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8) ? parsed : 0;
++    }();
++    if (configured != 0) { return configured; }
++    return warps <= 128 ? 1 : kWarpsPerBlock;
++}
++
++std::int64_t rotation_warps(std::int32_t k, std::int32_t tokens) {
++    return static_cast<std::int64_t>(k / kBlockSize) * static_cast<std::int64_t>(tokens);
+ }
+ 
+ } // namespace
+@@ -82,8 +102,10 @@ void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
+     const std::int32_t perm_nk  = permuted ? weight.hadamard_perm_nk : 0;
+     const std::int32_t perm_rep = permuted ? weight.hadamard_perm_rep : 1;
+ 
+-    ternary_rotate_bf16_kernel<<<rotation_grid(weight.k, x.ne[1]),
+-                                 kWarpsPerBlock * kThreadsPerWarp, 0, stream>>>(
++    const std::int64_t warps = rotation_warps(weight.k, x.ne[1]);
++    const int warp_block     = rotation_warps_per_block(warps);
++    ternary_rotate_bf16_kernel<<<static_cast<unsigned>((warps + warp_block - 1) / warp_block),
++                                 warp_block * kThreadsPerWarp, 0, stream>>>(
+         static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data),
+         weight.hadamard_signs, weight.hadamard_n_blk, weight.k, x.ne[1], perm_hd, perm_nk,
+         perm_rep, /*inverse=*/0);
+@@ -100,8 +122,11 @@ void launch_ternary_rotation_inverse_inplace(Tensor& data, const Weight& weight,
+             "ternary rotation: the embedding path does not carry a folded permutation");
+     }
+ 
+-    ternary_rotate_inverse_inplace_bf16_kernel<<<rotation_grid(weight.k, data.ne[1]),
+-                                                 kWarpsPerBlock * kThreadsPerWarp, 0, stream>>>(
++    const std::int64_t warps = rotation_warps(weight.k, data.ne[1]);
++    const int warp_block     = rotation_warps_per_block(warps);
++    ternary_rotate_inverse_inplace_bf16_kernel<<<
++        static_cast<unsigned>((warps + warp_block - 1) / warp_block),
++        warp_block * kThreadsPerWarp, 0, stream>>>(
+         static_cast<__nv_bfloat16*>(data.data), weight.hadamard_signs, weight.hadamard_n_blk,
+         weight.k, data.ne[1]);
+     CUDA_CHECK(cudaGetLastError());
+diff --git a/src/ops/linear/ternary/ternary_rotation_kernels.cuh b/src/ops/linear/ternary/ternary_rotation_kernels.cuh
+index 5d4ec5b4..0bb05945 100644
+--- a/src/ops/linear/ternary/ternary_rotation_kernels.cuh
++++ b/src/ops/linear/ternary/ternary_rotation_kernels.cuh
+@@ -74,8 +74,14 @@ __global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+                                            const float* __restrict__ signs, int n_blk, int k,
+                                            int tokens, int perm_hd, int perm_nk, int perm_rep,
+                                            int inverse) {
+-    const int lane   = threadIdx.x & (kThreadsPerWarp - 1);
+-    const int warp   = static_cast<int>(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
++    // blockDim, not the kWarpsPerBlock constant: this kernel is one warp per (1024-block, token)
++    // pair, so the grid is tiny and fixed by the data -- k=5120 at T=3 is 15 warps total. Packing
++    // them 8 to a block puts the whole launch on two SMs out of 66 and exposes the full latency of
++    // 32 dependent loads per warp. Reading the block size from the special register costs nothing
++    // and lets the launcher choose how to spread those 15 warps.
++    const int lane            = threadIdx.x & (kThreadsPerWarp - 1);
++    const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
++    const int warp   = static_cast<int>(blockIdx.x) * warps_per_block + (threadIdx.x >> 5);
+     const int blocks = k >> 10;
+     if (warp >= blocks * tokens) { return; }
+     const int block = warp % blocks;
+@@ -138,8 +144,9 @@ __global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+ __global__ void ternary_rotate_inverse_inplace_bf16_kernel(__nv_bfloat16* __restrict__ data,
+                                                            const float* __restrict__ signs,
+                                                            int n_blk, int k, int tokens) {
+-    const int lane   = threadIdx.x & (kThreadsPerWarp - 1);
+-    const int warp   = static_cast<int>(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
++    const int lane            = threadIdx.x & (kThreadsPerWarp - 1);
++    const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
++    const int warp   = static_cast<int>(blockIdx.x) * warps_per_block + (threadIdx.x >> 5);
+     const int blocks = k >> 10;
+     if (warp >= blocks * tokens) { return; }
+     const int block = warp % blocks;
+diff --git a/src/ops/linear/ternary/ternary_rowsplit_gemm.cu b/src/ops/linear/ternary/ternary_rowsplit_gemm.cu
+index d2a46624..156048d7 100644
+--- a/src/ops/linear/ternary/ternary_rowsplit_gemm.cu
++++ b/src/ops/linear/ternary/ternary_rowsplit_gemm.cu
+@@ -7,14 +7,44 @@
+ #include "ops/common/math.h"
+ #include "ops/linear/ternary/ternary_launch.h"
+ #include "ops/linear/ternary/ternary_rowsplit_gemv.cuh"
++#include "ops/linear/ternary/ternary_rowsplit_mma.cuh"
+ #include "ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh"
+ 
+ #include <cstdint>
++#include <cstdlib>
++#include <limits>
+ #include <stdexcept>
++#include <string>
++#include <type_traits>
+ 
+ namespace ninfer::ops::detail {
+ namespace {
+ 
++// Which kernel serves prefill (T >= 5).
++//
++//   unset / mma  tensor-core path (ternary_rowsplit_mma.cuh) -- the measured default
++//   block        token-blocked SIMT GEMV, kept as the fallback and as an A/B arm
++//   ref          the correctness-first reference kernel, the oracle for both
++//
++// A two-run A/B against `ref` is what qualifies a new path engine-side: it is the only comparison
++// that can catch a token-tile or activation-layout error, because at T == 1 the token-major and
++// row-major activation layouts coincide exactly. Read once, because the choice decides which
++// kernel enters a captured CUDA graph.
++enum class PrefillRoute { Mma, Block, Reference };
++
++PrefillRoute prefill_route() {
++    static const PrefillRoute route = [] {
++        const char* value = std::getenv("NINFER_TERNARY_PREFILL");
++        if (value == nullptr) { return PrefillRoute::Mma; }
++        const std::string text(value);
++        if (text == "ref") { return PrefillRoute::Reference; }
++        if (text == "block") { return PrefillRoute::Block; }
++        return PrefillRoute::Mma;
++    }();
++    return route;
++}
++
++
+ // Decode (T == 1) takes the warp-per-row GEMV for PQ2_0. K is a whole number of 128-groups for
+ // every width in this model, so that kernel needs no column guard.
+ void launch_pq2_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+@@ -100,12 +130,17 @@ void launch_by_qtype(const Tensor& x, const Weight& w, Tensor& out, std::int32_t
+ 
+ } // namespace
+ 
+-// A PQ2_0 weight can take the GEMV family whenever the layout did not pad K past the real width --
++// A PQ2_0 weight can take the fast family whenever the layout did not pad K past the real width --
+ // true for every width in this model (5120/6144/10240/17408 are all whole 128-groups), and checked
+-// here rather than assumed, because the GEMV reads whole groups without a column guard.
++// here rather than assumed, because these kernels read whole groups without a column guard.
++//
++// Every one of them walks the activation as x[token * w.k + column], so the x row pitch has to BE
++// w.k. That holds for both callers today (the raw path's hidden and the folded activation both
++// report w.k as ne[0]), but it is assumed rather than enforced anywhere else, and a mismatch would
++// read the wrong rows instead of failing. Checked here so all three routes agree on the gate.
+ bool gemv_admits(const Tensor& x, const Weight& w, std::int32_t max_tokens) {
+     return w.qtype == QType::PQ2_0_G128 && w.qhigh == nullptr && w.padded_shape[1] == w.k &&
+-           (w.k % 128) == 0 && x.ne[1] >= 1 && x.ne[1] <= max_tokens;
++           (w.k % 128) == 0 && x.ne[1] >= 1 && x.ne[1] <= max_tokens && x.ne[0] == w.k;
+ }
+ 
+ void launch_ternary_gemm_t1(const Tensor& x, const Weight& w, Tensor& out,
+@@ -117,54 +152,218 @@ void launch_ternary_gemm_t1(const Tensor& x, const Weight& w, Tensor& out,
+     launch_by_qtype<1>(x, w, out, out_row_stride, stream);
+ }
+ 
+-// ---------------------------------------------------------------------------
+-// Ternary PQ2_0 tensor-core path for the small-T regime (T = 2..8), implemented in
+-// ternary_rowsplit_mma_small_t.cuh. This is the batch fast path.
+-//
+-// The SIMT tile GEMV above reuses each weight across its tile but still pays one FMA per weight
+-// PER TOKEN, so its cost grows with T while its weight traffic does not: measured on a 322 MB
+-// PQ2_0 payload it takes 0.706 ms at T = 1 and 1.533 ms at T = 3, i.e. 2.2x the time for
+-// byte-identical traffic (211 GiB/s against 483 GiB/s). One mma.m16n8k16 carries 16 rows x 8
+-// tokens x 16 k, so every token in the tile rides the same weight read at no extra instruction
+-// cost.
++// One (kR, kT) instantiation of the blocked GEMV: grid.x tiles the rows in strides of
++// warps*kR, grid.y tiles the tokens in kT.
++template <int kR, int kT>
++void launch_pq2_gemv_tile_block_shape(const Tensor& x, const Weight& w, Tensor& out,
++                                      std::int32_t out_row_stride, std::int32_t groups_per_row,
++                                      std::int32_t tokens, cudaStream_t stream) {
++    const dim3 grid(static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock * kR)),
++                    static_cast<unsigned>(div_up(tokens, kT)), 1u);
++    const dim3 block(kGemvWarpsPerBlock * 32, 1u, 1u);
++    ternary_pq2_gemv_tile_block_kernel<kR, kT><<<grid, block, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
++        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), w.n,
++        groups_per_row, tokens, out_row_stride);
++}
++
++// Blocked GEMV launcher, for prefill. Both block shapes are occupancy levers rather than fixed
++// constants, and the measured behaviour on the target card is that the kernel is
++// activation-bound, not weight-bound (R=1/kT=8 reached 125.7 t/s at an effective weight
++// bandwidth of only 112 GB/s, against 422 GB/s for the T=1 GEMV). So the row block -- which
++// amortises activation loads across output rows -- is the stronger knob, and the token block
++// then trades weight traffic against register pressure. Both are env-selectable so one build
++// can sweep; the defaults are the measured winners.
++void launch_pq2_gemv_tile_block(const Tensor& x, const Weight& w, Tensor& out,
++                                std::int32_t out_row_stride, cudaStream_t stream) {
++    const std::int32_t groups_per_row = w.k / 128;
++    const std::int32_t tokens         = x.ne[1];
++    static const int rows_block = [] {
++        const char* value = std::getenv("NINFER_TERNARY_ROWS");
++        const int parsed  = value == nullptr ? 0 : std::atoi(value);
++        return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8) ? parsed : 4;
++    }();
++    static const int token_block = [] {
++        const char* value = std::getenv("NINFER_TERNARY_TILE");
++        const int parsed  = value == nullptr ? 0 : std::atoi(value);
++        return (parsed == 2 || parsed == 4 || parsed == 8) ? parsed : 8;
++    }();
++
++    const auto shape = [&](auto rows_tag, auto token_tag) {
++        launch_pq2_gemv_tile_block_shape<decltype(rows_tag)::value, decltype(token_tag)::value>(
++            x, w, out, out_row_stride, groups_per_row, tokens, stream);
++        CUDA_CHECK(cudaGetLastError());
++    };
++    using std::integral_constant;
++
++    if (rows_block == 1 && token_block == 2) { shape(integral_constant<int, 1>{}, integral_constant<int, 2>{}); }
++    else if (rows_block == 1 && token_block == 4) { shape(integral_constant<int, 1>{}, integral_constant<int, 4>{}); }
++    else if (rows_block == 1) { shape(integral_constant<int, 1>{}, integral_constant<int, 8>{}); }
++    else if (rows_block == 2 && token_block == 2) { shape(integral_constant<int, 2>{}, integral_constant<int, 2>{}); }
++    else if (rows_block == 2 && token_block == 4) { shape(integral_constant<int, 2>{}, integral_constant<int, 4>{}); }
++    else if (rows_block == 2) { shape(integral_constant<int, 2>{}, integral_constant<int, 8>{}); }
++    else if (rows_block == 8 && token_block == 2) { shape(integral_constant<int, 8>{}, integral_constant<int, 2>{}); }
++    else if (rows_block == 8 && token_block == 4) { shape(integral_constant<int, 8>{}, integral_constant<int, 4>{}); }
++    else if (rows_block == 8) { shape(integral_constant<int, 8>{}, integral_constant<int, 8>{}); }
++    else if (token_block == 2) { shape(integral_constant<int, 4>{}, integral_constant<int, 2>{}); }
++    else if (token_block == 4) { shape(integral_constant<int, 4>{}, integral_constant<int, 4>{}); }
++    else { shape(integral_constant<int, 4>{}, integral_constant<int, 8>{}); }
++}
++
++// The speculative verify pass (T = 2..4) gets its own tensor-core entry point, because the prefill
++// one tiles the token axis at 128 and would be 97% empty on three tokens. NINFER_TERNARY_VERIFY=tile
++// forces the SIMT token-tile GEMV back, as the A/B arm.
++bool verify_uses_small_t() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_TERNARY_VERIFY");
++        return value == nullptr || std::string(value) != "tile";
++    }();
++    return enabled;
++}
++
++// A warp takes one whole 128-wide quant group, so K has to hold whole K groups.
++inline constexpr std::int32_t kSmallTGroupK = 8 * 128;
++
++// Row block per CTA, i.e. how many mma m-tiles share one activation staging. 16 is the shape the
++// kernel was written at and stays the reference; 32 and 48 exist because activations cost more of
++// the load pipe than codes do, so widening the block should leave that cost flat while the codes
++// grow. Measured on the six verify shapes at tokens=4 that is worth 6-15% on the largest one
++// (34816x5120: 84 -> 77 -> 71 us) and is inside noise on the rest -- a net ~0.5-0.9 ms a round,
++// which is small enough that the engine-level A/B, not the kernel harness, decides it.
+ //
+-// T >= 2 only: the T = 1 endpoint of that same measurement (0.603 against 0.706 ms) did NOT
+-// transfer to the real engine -- see the note on launch_ternary_gemm_t1 -- so decode stays on
+-// the GEMV. Selected inside launch_ternary_gemm_t8; roll back with NINFER_TERNARY_MMA=0.
+-// ---------------------------------------------------------------------------
+-bool mma_admits(const Weight& w, std::int32_t out_row_stride) {
+-    return w.qtype == QType::PQ2_0_G128 && w.qhigh == nullptr && w.padded_shape[1] == w.k &&
+-           (w.k % kTernaryMmaChunkK) == 0 && out_row_stride >= w.n;
++// It is NOT the free win the load-mix argument predicts: dropping activation traffic by a third
++// only moved the effective rate from 453 to 480 GB/s against a 637 GB/s ceiling, so the kernel is
++// not L2-bandwidth-bound after all. Kept env-selectable rather than hardcoded for that reason.
++int small_t_rows_per_cta() {
++    static const int rows = [] {
++        const char* value = std::getenv("NINFER_TERNARY_SMALL_T_ROWS");
++        const int parsed  = value == nullptr ? 0 : std::atoi(value);
++        return (parsed == 16 || parsed == 32 || parsed == 48) ? parsed : 32;
++    }();
++    return rows;
+ }
+ 
+-void launch_pq2_mma_small_t(const Tensor& x, const Weight& w, Tensor& out,
+-                            std::int32_t out_row_stride, std::int32_t tokens,
+-                            cudaStream_t stream) {
+-    // The staging is static shared memory (a compile-time 32 KB), so there is no dynamic size to
+-    // pass and no cudaFuncSetAttribute opt-in to make -- which is also what keeps it legal inside
+-    // the captured CUDA graphs this op runs in.
+-    const unsigned grid = static_cast<unsigned>(div_up(w.n, kTernaryMmaRowsPerCta));
+-    ternary_pq2_mma_small_t_kernel<<<grid, kTernaryMmaThreads, 0, stream>>>(
+-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), w.n,
+-        w.k, tokens, out_row_stride);
++void launch_small_t(const Tensor& x, const Weight& w, Tensor& out, std::int32_t out_row_stride,
++                    cudaStream_t stream) {
++    const std::int32_t rows = w.n;
++    const auto* x_ptr       = static_cast<const __nv_bfloat16*>(x.data);
++    const auto* codes       = static_cast<const std::uint8_t*>(w.qdata);
++    const auto* scales      = static_cast<const std::uint8_t*>(w.scales);
++    auto* out_ptr           = static_cast<__nv_bfloat16*>(out.data);
++    const auto grid_for     = [rows](int row_block) {
++        return dim3(static_cast<unsigned>(div_up(rows, row_block)), 1u, 1u);
++    };
++    const auto args = [&](auto tag) {
++        constexpr int kRows = decltype(tag)::value;
++        ternary_small_t_mma_kernel<8, (kRows == 16 ? 4 : (kRows == 32 ? 3 : 2)), kRows>
++            <<<grid_for(kRows), TernarySmallTSchedule::kThreads, 0, stream>>>(
++                x_ptr, codes, scales, out_ptr, rows, w.k, x.ne[1], out_row_stride);
++    };
++    using std::integral_constant;
++    switch (small_t_rows_per_cta()) {
++    case 16: args(integral_constant<int, 16>{}); break;
++    case 48: args(integral_constant<int, 48>{}); break;
++    default: args(integral_constant<int, 32>{}); break;
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// The measured winner of the K=64 sweep on the target card: 64 output rows, a 128-token tile, 8
++// warps laid out 2x4, two cp.async stages, two CTAs per SM. It beat 64x64, 128x64, 16-warp and
++// 32-warp variants (37.0 ms against 41.4-54.8 on the 248320x5120 head at T=1024).
++using TernaryMmaPrefillSchedule = TernaryMmaSchedule<64, 128, 64, 32, 32, 2, 2>;
++
++// A token tile narrower than half the block wastes the pipeline, so short verification-shaped T
++// stays on the SIMT path even though the kernel would be correct there.
++inline constexpr std::int32_t kMmaMinTokens = 64;
++
++template <class Schedule>
++void launch_ternary_mma(const Tensor& x, const Weight& w, Tensor& out,
++                        std::int32_t out_row_stride, cudaStream_t stream) {
++    const std::int32_t rows   = w.n;
++    const std::int32_t k      = w.k;
++    const std::int32_t tokens = x.ne[1];
++    // The reference launcher checks this too (launch_gemm does), and an undersized stride would
++    // silently scatter the tile across neighbouring rows rather than fail.
++    if (out_row_stride < rows) {
++        throw std::invalid_argument("ternary mma: output row stride is smaller than the tile");
++    }
++    // Restated here rather than left to gemv_admits alone: the kernel stages whole 64-wide K tiles
++    // and reads exactly two planes, so a padded K or a high plane would index out of the group.
++    // Both call sites pass through gemv_admits today; this is the guard for the next one.
++    if (w.padded_shape[1] != k || (k % 128) != 0) {
++        throw std::invalid_argument("ternary mma: needs a whole-group K with no padding");
++    }
++    const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::kBlockRows)),
++                    static_cast<unsigned>(div_up(tokens, Schedule::kBlockCols)), 1u);
++    const bool full = (rows % Schedule::kBlockRows) == 0 && (tokens % Schedule::kBlockCols) == 0;
++
++    const auto* x_ptr     = static_cast<const __nv_bfloat16*>(x.data);
++    const auto* codes     = static_cast<const std::uint8_t*>(w.qdata);
++    const auto* scales    = static_cast<const std::uint8_t*>(w.scales);
++    auto* out_ptr         = static_cast<__nv_bfloat16*>(out.data);
++
++    if (full) {
++        ternary_rowsplit_mma_kernel<Schedule, true><<<grid, Schedule::kThreads, 0, stream>>>(
++            x_ptr, codes, scales, out_ptr, rows, k, tokens, w.padded_shape[1], out_row_stride);
++    } else {
++        ternary_rowsplit_mma_kernel<Schedule, false><<<grid, Schedule::kThreads, 0, stream>>>(
++            x_ptr, codes, scales, out_ptr, rows, k, tokens, w.padded_shape[1], out_row_stride);
++    }
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+ void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
+                             std::int32_t out_row_stride, cudaStream_t stream) {
+-    // The speculative verify pass runs T = draft + 1 (2..4 here). Prefill arrives with T >= 128
+-    // and is carried by the same kernel, at ceil(T/8) weight passes. The reference tiled kernel
+-    // wastes five of its eight token slots at verify size and needs a 128-thread CTA plus seven
+-    // barriers per output row, which cost more than the whole decode step it was verifying.
+-    if (ternary_mma_enabled() && mma_admits(w, out_row_stride) && x.ne[1] >= 2) {
+-        launch_pq2_mma_small_t(x, w, out, out_row_stride, x.ne[1], stream);
+-        return;
+-    }
++    // The speculative verify pass runs T = draft + 1 (2..4 here). The reference tiled kernel wastes
++    // five of its eight token slots at that size and needs a 128-thread CTA plus seven barriers per
++    // output row, which cost more than the whole decode step it was verifying. The small-tile GEMV
++    // reads each weight once for all four tokens instead.
++    //
++    // The row-blocked kernel below was measured on this same path and LOST: routing T = 2..4 to it
++    // dropped the MTP decode from 43.0 to 32.8 t/s (en) and 57.7 to 43.9 (zh). NCU says why, and
++    // the reason rules the whole family out for the verify shape rather than just that one config.
++    // On the 248320-row head the tile kernel already sits at 95.47% achieved occupancy, 36
++    // registers and 78% SM throughput -- the ALU pipe ("integer and logic operations") is the top
++    // utilizer, 909e6 instructions in 1.70 ms against a 1.32 ms pure-issue floor. It is issue-bound
++    // with no occupancy left to buy, so trading registers for fewer loads can only lose: the same
++    // head under the row block runs at 63 registers, 65.67% occupancy and 47.95% SM throughput.
++    //
++    // The verify pass is nonetheless NOT re-reading weights -- nsys shows one forward pass, 401
++    // launches, against 407 for a T=1 decode step -- so the cost is per-token issue work, not
++    // weight traffic. That is why raising the draft count, which amortises the per-group 2-bit
++    // decode over more tokens, is the productive lever here; see the plan document.
+     if (gemv_admits(x, w, 4)) {
++        if (verify_uses_small_t() && (w.k % kSmallTGroupK) == 0) {
++            launch_small_t(x, w, out, out_row_stride, stream);
++            return;
++        }
+         launch_pq2_gemv_tile(x, w, out, out_row_stride, x.ne[1], stream);
+         return;
+     }
++    // The verify-shaped entry above requires T <= 4, so everything from a short prompt (T as low
++    // as 5) to a full prefill chunk lands here. The CLI constrains the CHUNK to a multiple of 128
++    // (apps/cli/options.cpp), not the actual token count, so T is only a multiple of 128 for a
++    // prompt that fills a whole chunk.
++    //
++    // The tensor-core path is the default because the SIMT one is issue-bound and has no occupancy
++    // left: NCU on the 248320-row head put the token-blocked GEMV at 95.47% occupancy, ALU the top
++    // pipe, and 909e6 instructions against a 1.32 ms pure-issue floor. Measured across every
++    // prefill shape in this model at T=1024, MMA is 8.3-9.8x faster than that GEMV.
++    if (prefill_route() == PrefillRoute::Mma && x.ne[1] >= kMmaMinTokens &&
++        gemv_admits(x, w, std::numeric_limits<std::int32_t>::max())) {
++        launch_ternary_mma<TernaryMmaPrefillSchedule>(x, w, out, out_row_stride, stream);
++        return;
++    }
++    // Fallback and A/B arm. It still beats the correctness-first reference kernel, which measured
++    // 7% of the card's sustained read ceiling where the GEMV shape reaches 66% on the same
++    // weights. NINFER_TERNARY_PREFILL=ref forces the reference kernel, so an A/B run can qualify
++    // either fast path engine-side (T = 1 alone cannot catch a token-tile or layout error).
++    if (prefill_route() != PrefillRoute::Reference &&
++        gemv_admits(x, w, std::numeric_limits<std::int32_t>::max())) {
++        launch_pq2_gemv_tile_block(x, w, out, out_row_stride, stream);
++        return;
++    }
+     launch_by_qtype<8>(x, w, out, out_row_stride, stream);
+ }
+ 
+diff --git a/src/ops/linear/ternary/ternary_rowsplit_gemm.cuh b/src/ops/linear/ternary/ternary_rowsplit_gemm.cuh
+index 4c719772..244ee9ba 100644
+--- a/src/ops/linear/ternary/ternary_rowsplit_gemm.cuh
++++ b/src/ops/linear/ternary/ternary_rowsplit_gemm.cuh
+@@ -23,10 +23,8 @@ namespace ninfer::ops::detail {
+ // (128) threads, so thread `index` owns weight `index` inside every 128-weight group:
+ // a group is decoded once by the whole CTA and reused across the whole token tile, which
+ // is what keeps this from being 128x redundant. This is the "dequantize the block and
+-// accumulate in F32" shape that upstream's reference kernel uses; a repack/SIMT fast path is
+-// still deliberately left out. The MMA path for the small-T regime (T = 2..8) -- which also
+-// carries prefill, at ceil(T/8) weight passes -- now ships as ternary_rowsplit_mma_small_t.cuh
+-// and is selected inside launch_ternary_gemm_t8 (roll back with NINFER_TERNARY_MMA=0).
++// accumulate in F32" shape that upstream's reference kernel uses; a repack/SIMT fast path
++// and an MMA path are deliberately left out until the numerics are pinned down.
+ //
+ // Activation layout is [K, T] with ne[0] = K CONTIGUOUS, i.e. the ninfer/ggml convention: element
+ // (column, token) lives at token * k + column. Output is [N, T] the same way: (row, token) at
+diff --git a/src/ops/linear/ternary/ternary_rowsplit_gemv.cuh b/src/ops/linear/ternary/ternary_rowsplit_gemv.cuh
+index cee2def1..a199aa23 100644
+--- a/src/ops/linear/ternary/ternary_rowsplit_gemv.cuh
++++ b/src/ops/linear/ternary/ternary_rowsplit_gemv.cuh
+@@ -40,6 +40,13 @@ inline constexpr int kGemvCodeBytesPerGroup  = 32;
+ inline constexpr int kGemvScaleBytesPerGroup = 2;
+ inline constexpr int kGemvGroupK             = 128;
+ 
++// Resident-CTA floor for the blocked prefill GEMV. Raising it forces ptxas to spend fewer
++// registers, which buys resident warps at the cost of some recomputation. Measured on the target
++// card: unpinned 116 regs -> 162.4 t/s, 3 CTAs 80 regs -> 175.4 t/s, 4 CTAs 64 regs -> 68.2 t/s.
++// The last one spills 268 bytes per thread and loses more than the occupancy gains, so 3 is the
++// measured optimum, not a conservative default.
++inline constexpr int kBlockMinCtasPerSm = 3;
++
+ __device__ __forceinline__ float gemv_scale(const std::uint8_t* scale_ptr) {
+     // One 16-bit load instead of two byte loads plus a shift/or; the scale plane is 2-byte aligned.
+     const std::uint16_t bits = *reinterpret_cast<const std::uint16_t*>(scale_ptr);
+@@ -161,4 +168,157 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
+     }
+ }
+ 
++// Token-blocked variant, for PREFILL: the prefill chunk.
++//
++// The verify kernel above takes the whole T at once and is capped at kT <= 8 by register
++// pressure, so it cannot serve a prefill chunk -- the CLI requires that chunk to be a multiple
++// of 128 (apps/cli/options.cpp: "--prefill-chunk must be a multiple of 128"). Without this
++// kernel, every prefill therefore falls through to the correctness-first reference kernel in
++// ternary_rowsplit_gemm.cuh, whose shape is one 128-thread CTA per output row plus seven
++// block-wide barriers per row and a four-way duplicated code load (threads index>>2 share a
++// byte). Published patch state measured that kernel at 42 GiB/s against this card's 638.7 GB/s
++// sustained-read ceiling -- 7%.
++//
++// This kernel keeps the GEMV shape -- lane l reads code byte l and so covers columns 4l..4l+3,
++// weights are decoded once per group and reused for the whole token tile, and the only reduction
++// is five shuffle steps -- but tiles BOTH axes: the token axis across blockIdx.y (kT tokens) and
++// the row axis across kR rows per warp.
++//
++// Why the row axis matters: measured on the target card the R=1/kT=8 shape reaches 125.7 t/s at
++// an effective weight bandwidth of only 112 GB/s, while the T=1 GEMV reads at 422 GB/s. The
++// kernel is therefore NOT weight-bandwidth-bound -- it is bound by the activation side, which
++// loads kT*4 elements per lane per group against a single weight byte. Since activations are
++// identical for every output row of the same token, widening the warp over rows amortises them:
++//
++//   loads per FMA  =  (2*kT + kR) / (4 * kR * kT)
++//
++// R=1,kT=8 gives 0.53; R=2,kT=8 gives 0.28; R=4,kT=4 gives 0.19. The cost is registers
++// (kR*kT accumulators plus 2*kT activation pairs), which is why both axes are capped small.
++//
++// The min-CTAs bound matters more than it looks. ptxas gives the 4x8 shape 116 registers
++// unpinned, which fits only two 256-thread CTAs per SM -- 16 of 48 warps. The T=1 GEMV below
++// runs 43 registers at ~83% occupancy, and this file's own note says occupancy is what the
++// GEMV family is tuned for. Pinning the bound makes ptxas trade registers for resident warps;
++// the measured effect is in the plan document.
++template <int kR, int kT>
++__global__ __launch_bounds__(kGemvWarpsPerBlock * 32, kBlockMinCtasPerSm)
++void ternary_pq2_gemv_tile_block_kernel(const __nv_bfloat16* __restrict__ x,
++                                        const std::uint8_t* __restrict__ codes,
++                                        const std::uint8_t* __restrict__ scales,
++                                        __nv_bfloat16* __restrict__ out, std::int32_t rows,
++                                        std::int32_t groups_per_row, std::int32_t tokens,
++                                        std::int32_t out_row_stride) {
++    static_assert(kR >= 1 && kR <= 8, "row block must keep accumulators in registers");
++    static_assert(kT >= 1 && kT <= 8, "token block must keep accumulators in registers");
++    const int lane          = static_cast<int>(threadIdx.x) & 31;
++    const int warp_in_block = static_cast<int>(threadIdx.x) >> 5;
++    const int warp = static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + warp_in_block;
++    const int row0    = warp * kR;
++    const int token0  = static_cast<int>(blockIdx.y) * kT;
++    // CTA-uniform early exit only: a per-warp exit here would leave the other warps waiting at the
++    // flush barrier below. A partially covered CTA (rows not a multiple of kR*warps) keeps every
++    // warp alive and guards its own work with `active` instead.
++    if (static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock * kR >= rows) { return; }
++    const bool active = row0 < rows;
++
++    // Results land here first so the global write can be coalesced. Writing straight out from lane 0
++    // costs one 2-byte store per (row, token) -- 32 of them per warp, each its own 32-byte sector,
++    // which NCU flags as "only 2.0 of the 32 bytes transmitted per sector are utilized". A CTA owns
++    // a contiguous row range and a contiguous token range, so staging and flushing per token turns
++    // that into one 64-byte write per token.
++    __shared__ __nv_bfloat16 staged[kT][kGemvWarpsPerBlock * kR];
++
++    float accumulator[kR][kT];
++#pragma unroll
++    for (int r = 0; r < kR; ++r) {
++#pragma unroll
++        for (int t = 0; t < kT; ++t) { accumulator[r][t] = 0.0f; }
++    }
++
++    for (int group = 0; active && group < groups_per_row; ++group) {
++        const std::int32_t base = group * kGemvGroupK + lane * 4;
++
++        // Activations: loaded ONCE per group and reused by every row this warp owns. This is the
++        // whole point of kR -- with kR == 1 they are re-loaded for each row the warp covers.
++        float2 low[kT];
++        float2 high[kT];
++#pragma unroll
++        for (int t = 0; t < kT; ++t) {
++            const std::int32_t token = token0 + t;
++            low[t]  = make_float2(0.0f, 0.0f);
++            high[t] = make_float2(0.0f, 0.0f);
++            if (token < tokens) {
++                const __nv_bfloat16* x_token =
++                    x + static_cast<std::int64_t>(token) * groups_per_row * kGemvGroupK;
++                low[t]  = __bfloat1622float2(
++                    *reinterpret_cast<const __nv_bfloat162*>(x_token + base));
++                high[t] = __bfloat1622float2(
++                    *reinterpret_cast<const __nv_bfloat162*>(x_token + base + 2));
++            }
++        }
++
++#pragma unroll
++        for (int r = 0; r < kR; ++r) {
++            const int row = row0 + r;
++            if (row < rows) {
++                const std::uint8_t* code_row =
++                    codes + static_cast<std::int64_t>(row) * groups_per_row *
++                                kGemvCodeBytesPerGroup;
++                const std::uint8_t* scale_row =
++                    scales + static_cast<std::int64_t>(row) * groups_per_row *
++                                 kGemvScaleBytesPerGroup;
++                const std::uint8_t raw = code_row[group * kGemvCodeBytesPerGroup + lane];
++                const float scale = gemv_scale(scale_row + group * kGemvScaleBytesPerGroup);
++                const float weight0 = static_cast<float>(static_cast<int>(raw & 3u) - 1);
++                const float weight1 = static_cast<float>(static_cast<int>((raw >> 2) & 3u) - 1);
++                const float weight2 = static_cast<float>(static_cast<int>((raw >> 4) & 3u) - 1);
++                const float weight3 = static_cast<float>(static_cast<int>((raw >> 6) & 3u) - 1);
++#pragma unroll
++                for (int t = 0; t < kT; ++t) {
++                    if (token0 + t < tokens) {
++                        const float dot =
++                            fmaf(weight0, low[t].x,
++                                 fmaf(weight1, low[t].y,
++                                      fmaf(weight2, high[t].x, weight3 * high[t].y)));
++                        accumulator[r][t] = fmaf(scale, dot, accumulator[r][t]);
++                    }
++                }
++            }
++        }
++    }
++
++#pragma unroll
++    for (int r = 0; r < kR; ++r) {
++#pragma unroll
++        for (int t = 0; t < kT; ++t) {
++            float value = accumulator[r][t];
++#pragma unroll
++            for (int offset = 16; offset > 0; offset >>= 1) {
++                value += __shfl_down_sync(0xffffffffu, value, offset);
++            }
++            if (lane == 0 && active) {
++                // Row order inside the CTA matches the global row order: warp_in_block owns rows
++                // [warp_in_block*kR, ...) of the block's contiguous range.
++                staged[t][warp_in_block * kR + r] = __float2bfloat16_rn(value);
++            }
++        }
++    }
++    __syncthreads();
++
++    // Coalesced flush. Token-major output puts element (row, token) at token * out_row_stride + row,
++    // and this CTA owns one contiguous row range, so a fixed token is a contiguous run.
++    constexpr int kRowsPerBlock = kGemvWarpsPerBlock * kR;
++    const int row_base          = static_cast<int>(blockIdx.x) * kRowsPerBlock;
++#pragma unroll
++    for (int i = threadIdx.x; i < kT * kRowsPerBlock; i += kGemvWarpsPerBlock * 32) {
++        const int t     = i / kRowsPerBlock;
++        const int r     = i % kRowsPerBlock;
++        const int token = token0 + t;
++        const int row   = row_base + r;
++        if (token < tokens && row < rows) {
++            out[static_cast<std::int64_t>(token) * out_row_stride + row] = staged[t][r];
++        }
++    }
++}
++
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/ternary/ternary_rowsplit_mma.cuh b/src/ops/linear/ternary/ternary_rowsplit_mma.cuh
+new file mode 100644
+index 00000000..37615f83
+--- /dev/null
++++ b/src/ops/linear/ternary/ternary_rowsplit_mma.cuh
+@@ -0,0 +1,402 @@
++#pragma once
++
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++
++// PQ2_0 RowSplit x BF16 tensor-core GEMM, for the prefill shape.
++//
++// out[rows, cols] = W[rows, k] * x[k, cols]
++//
++// Same physical skeleton as q4_rowsplit_gemm_mma.cuh: a CTA owns a BlockRows x BlockCols output
++// tile and walks K a tile at a time, staging raw codes and fp16 scales through a cp.async pipeline,
++// decoding them to BF16 in shared memory, then consuming them with m16n8k16 BF16 MMA.
++//
++// Why this path exists. The SIMT prefill GEMV spends four FMA instructions per weight, which pins
++// it to the ALU issue pipe -- NCU on the 248320-row head: ALU the top utilizer, 95.47% occupancy,
++// 909e6 instructions against a 1.32 ms pure-issue floor, and no occupancy left to buy. MMA removes
++// the multiplies (one m16n8k16 carries 2048 MACs) but not the decode, so the decode is what has to
++// get cheap.
++//
++// Decoding a byte. PQ2_0 packs four two-bit codes per byte, and the codes are {0,1,2} meaning
++// {-1,0,+1}. Two shifts and two masks split a byte into two nibble pairs, each pair separated into
++// one byte per code; __byte_perm then interleaves half(1024.0) so a single __hsub2 by half(1025.0)
++// lands on exactly {-1,0,+1}. Six instructions per byte, 1.5 per weight, against the SIMT path's
++// per-weight FMA. The bias must be 1024, not 2048: half's ULP at 2048 is 2.0 and 2049 would round.
++// Selectors must stay in 0..7, because prmt reads 8..15 as its sign-replicate modes.
++//
++// K tile = 64, half a group. The ternary group is 128 wide, which is what the scale is per. A
++// 128-wide tile works and was measured, but its activation staging alone is 64 KiB at BlockCols
++// 128, which forces dynamic shared memory (>48 KiB), one CTA per SM, and 16.7% occupancy. NCU on
++// that shape: DRAM 9.6%, tensor 28%, issue 23% -- latency-bound for want of resident warps.
++// Halving the tile halves the staging and buys a second CTA; measured 48.3 -> 37.0 ms on the
++// 248320x5120 head at T=1024. It also keeps every schedule under the static 48 KiB budget, which
++// matters because cudaFuncSetAttribute is illegal inside a CUDA graph capture and prefill tiles
++// are captured.
++//
++// The scale is folded into the decoded value rather than applied after accumulation. That costs
++// one bit of mantissa relative to the SIMT path (fp16 scale rounded to bf16), so the numerics are
++// NOT bit-identical to the reference kernel: max relative deviation 5-6e-3 against the reference
++// kernel's 2.5-2.9e-3, both dominated by the bf16 output rounding. Engine-side the two paths land
++// within 0.015% on perplexity (9.69192 against the reference kernel's 9.6905 over 110 windows).
++//
++// What was tried and did not help, so it is not here:
++//
++//   - Double-buffered A/B fragments, so the ldmatrix for k-step ki+1 issues before the multiplies
++//     of step ki (the trick q4_rowsplit_gemm_mma.cuh uses). Measured exactly flat: 37.024 ms
++//     against 37.029 on the 248320x5120 head. The ldmatrix is evidently not what the warps wait
++//     on. NCU says the wait is on the execution pipe (4.7 of the 11.83 cycles between issues), and
++//     at 4 warps per scheduler that pipe is the tensor unit itself.
++//   - BlockRows 96 instead of 64, which cuts the activation traffic by a third. 34.8 ms, 6%.
++//   - 16 and 32 warps per CTA: 42.0 and 61.8 ms. More warps make it worse, not better.
++//
++// The standing limit: 248320x5120 at T=1024 runs 37.0 ms with tensor at 37.9% of its pipe and
++// every other pipe under 42%. Instruction count is not the constraint (issue slots 23%), nor is
++// DRAM (12.9%). It is latency across a chain that is only 8 independent mma deep per warp, and
++// nothing tried so far lengthens that chain.
++
++#include "ops/common/mma.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include <cstdint>
++
++namespace ninfer::ops::detail {
++
++// XOR swizzle for a [rows][BlockK] BF16 tile -- identical in spirit to q4_mma_swizzle_k64, and
++// valid for any BlockK that is a multiple of 8.
++__device__ __forceinline__ int ternary_mma_swizzle(int row, int col) {
++    return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
++}
++
++// One byte of four 2-bit codes -> two BF16 pairs, values already scaled.
++//
++//   byte layout   c0 | c1<<2 | c2<<4 | c3<<6      (c in {0,1,2} meaning {-1,0,+1})
++//   a             c0 in byte 0, c1 in byte 1
++//   c             c2 in byte 0, c3 in byte 1
++//   __byte_perm   interleaves each with half(1024.0) -> {1024+c, 1024+c}
++//   __hsub2       by half(1025.0) -> exactly {c-1, c-1}
++//
++// half(1024.0) is 0x6400 and the exponent puts the ULP at 1.0, so 1024, 1025 and 1026 are all
++// exactly representable; that is why the bias is 1024 and not 2048 (whose ULP is 2.0 and would
++// round 2049).
++__device__ __forceinline__ void ternary_mma_decode_byte(std::uint8_t byte, __half2 scale2,
++                                                        unsigned& lo_bits, unsigned& hi_bits) {
++    const unsigned v = static_cast<unsigned>(byte);
++    const unsigned a = (v & 0x03u) | ((v & 0x0Cu) << 6);       // c0 -> byte 0, c1 -> byte 1
++    const unsigned c = ((v >> 4) & 0x03u) | ((v & 0xC0u) << 2); // c2 -> byte 0, c3 -> byte 1
++
++    constexpr unsigned kMagic = 0x64006400u; // half 1024.0 in both lanes
++    constexpr unsigned kBias  = 0x64016401u; // half 1025.0 in both lanes
++
++    // Selectors must stay in 0..7: prmt treats 8..15 as the sign-replicate modes, not as an
++    // index into the second operand. 0x5150 = {a[0], b[1], a[1], b[1]}.
++    const unsigned wa = __byte_perm(a, kMagic, 0x5150u); // byte order: c0, 0x64, c1, 0x64
++    const unsigned wc = __byte_perm(c, kMagic, 0x5150u);
++
++    const __half2 bias = *reinterpret_cast<const __half2*>(&kBias);
++    __half2 ha = *reinterpret_cast<const __half2*>(&wa);
++    __half2 hc = *reinterpret_cast<const __half2*>(&wc);
++    ha = __hmul2(__hsub2(ha, bias), scale2);
++    hc = __hmul2(__hsub2(hc, bias), scale2);
++
++    const __nv_bfloat162 ba = __float22bfloat162_rn(__half22float2(ha));
++    const __nv_bfloat162 bc = __float22bfloat162_rn(__half22float2(hc));
++    lo_bits = *reinterpret_cast<const unsigned*>(&ba);
++    hi_bits = *reinterpret_cast<const unsigned*>(&bc);
++}
++
++template <int BlockRows_, int BlockCols_, int BlockK_, int WarpRows_, int WarpCols_,
++          int PipelineStages_, int LaunchBoundsMinBlocks_>
++struct TernaryMmaSchedule {
++    static constexpr int kBlockRows = BlockRows_;
++    static constexpr int kBlockCols = BlockCols_;
++    static constexpr int kBlockK    = BlockK_;
++    static constexpr int kWarpRows  = WarpRows_;
++    static constexpr int kWarpCols  = WarpCols_;
++
++    static constexpr int kPipelineStages        = PipelineStages_;
++    static constexpr int kLaunchBoundsMinBlocks = LaunchBoundsMinBlocks_;
++
++    static constexpr int kWarpGridRows = kBlockRows / kWarpRows;
++    static constexpr int kWarpGridCols = kBlockCols / kWarpCols;
++    static constexpr int kWarps        = kWarpGridRows * kWarpGridCols;
++    static constexpr int kThreads      = kWarps * 32;
++    static constexpr int kMmaRows    = kWarpRows / 16;
++    static constexpr int kMmaCols    = kWarpCols / 8;
++    static constexpr int kMmaKSteps  = kBlockK / 16;
++    static constexpr int kGroupK     = 128; // the ternary quant group is 128 wide
++    static constexpr int kGroupBytes = 32;
++
++    // Codes staged per row for one K tile, and the scale is the group's.
++    static constexpr int kCodeBytesPerTile = kBlockK / 4;
++    static constexpr int kScaleBytes       = 2;
++
++    // How many rows one warp decodes per step: 32 lanes / bytes per row.
++    static constexpr int kRowsPerDecodeStep = 32 / kCodeBytesPerTile;
++
++    // Staged shared memory: the decoded BF16 A tile, the BF16 activation pipeline, the raw codes
++    // and the fp16 scales. Kept as a class constant so the kernel can size a static array with it.
++    static constexpr int kSharedBytes =
++        kBlockRows * kBlockK * 2 + kPipelineStages * kBlockCols * kBlockK * 2 +
++        kPipelineStages * kBlockRows * kCodeBytesPerTile + kPipelineStages * kBlockRows * kScaleBytes;
++
++    static_assert(kSharedBytes <= 48 * 1024, "ternary MMA staged shared exceeds the 48 KiB budget");
++    static_assert(kGroupK % kBlockK == 0, "K tile must divide the 128-wide ternary group");
++    // The codes are staged with cp_async<16>, so a K tile has to carry whole 16-byte chunks. A
++    // half-group tile is exactly one chunk; anything smaller would stage nothing at all.
++    static_assert(kCodeBytesPerTile >= 16 && (kCodeBytesPerTile % 16) == 0,
++                  "a K tile must stage whole 16-byte code chunks");
++    static_assert((32 % kCodeBytesPerTile) == 0,
++                  "a warp must split evenly over the K tile's code bytes");
++    static_assert(kBlockRows % kWarpRows == 0 && kBlockCols % kWarpCols == 0);
++    static_assert(kWarpRows % 16 == 0 && kWarpCols % 8 == 0);
++    static_assert(kPipelineStages >= 2 && kPipelineStages <= 8);
++    static_assert(kWarps >= 1 && kThreads <= 1024);
++};
++
++// clang-format off
++template <class Schedule_, bool Full>
++__global__ __launch_bounds__(Schedule_::kThreads, Schedule_::kLaunchBoundsMinBlocks)
++void ternary_rowsplit_mma_kernel(
++    const __nv_bfloat16* __restrict__ x,
++    const std::uint8_t* __restrict__ codes,
++    const std::uint8_t* __restrict__ scales,
++    __nv_bfloat16* __restrict__ out,
++    std::int32_t rows,
++    std::int32_t k,
++    std::int32_t cols,
++    std::int32_t padded_k,
++    std::int32_t out_row_stride) {
++    // clang-format on
++    using Schedule   = Schedule_;
++    constexpr int BM = Schedule::kBlockRows;
++    constexpr int BN     = Schedule::kBlockCols;
++    constexpr int BK     = Schedule::kBlockK;
++    constexpr int WM     = Schedule::kWarpRows;
++    constexpr int WN     = Schedule::kWarpCols;
++    constexpr int MT     = Schedule::kMmaRows;
++    constexpr int NT     = Schedule::kMmaCols;
++    constexpr int KSUB   = Schedule::kMmaKSteps;
++    constexpr int S      = Schedule::kPipelineStages;
++    constexpr int CBT    = Schedule::kCodeBytesPerTile;
++
++    // Static, not dynamic: the schedule is fixed at compile time and the budget stays under the
++    // engine's 48 KiB convention, which keeps cudaFuncSetAttribute out of the picture entirely --
++    // that call is illegal inside a CUDA graph capture, and prefill tiles are captured.
++    __shared__ __align__(16) std::uint8_t smem_raw[Schedule::kSharedBytes];
++    __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(smem_raw);
++    __nv_bfloat16* Bs = As + BM * BK;
++    std::uint8_t* Cr  = reinterpret_cast<std::uint8_t*>(Bs + S * BN * BK);
++    std::uint8_t* Sr  = Cr + S * BM * CBT;
++
++    const int groups_per_row = padded_k / 128;
++    const int k_tiles        = padded_k / BK;
++    const int tid            = static_cast<int>(threadIdx.x);
++    const int warp           = tid >> 5;
++    const int lane           = tid & 31;
++    const int warp_row       = warp / Schedule::kWarpGridCols;
++    const int warp_col       = warp % Schedule::kWarpGridCols;
++    const int mma_row        = lane >> 2;
++    const int mma_col        = lane & 3;
++
++    const int row0 = static_cast<int>(blockIdx.x) * BM;
++    const int col0 = static_cast<int>(blockIdx.y) * BN;
++
++    float accum[MT][NT][4];
++#pragma unroll
++    for (int mi = 0; mi < MT; ++mi) {
++#pragma unroll
++        for (int ni = 0; ni < NT; ++ni) {
++            accum[mi][ni][0] = 0.0f;
++            accum[mi][ni][1] = 0.0f;
++            accum[mi][ni][2] = 0.0f;
++            accum[mi][ni][3] = 0.0f;
++        }
++    }
++
++    const int a_matrix     = lane >> 3;
++    const int a_inner_row  = lane & 7;
++    const int a_row_offset = a_inner_row + ((a_matrix & 1) << 3);
++    const int a_col_offset = (a_matrix >> 1) << 3;
++    const int b_inner_row  = lane & 7;
++    const int b_k_offset   = ((lane >> 3) & 1) << 3;
++
++    auto stage_activation = [&](int stage, int k_tile) {
++        const int k0 = k_tile * BK;
++#pragma unroll 1
++        for (int item = tid; item < BN * (BK / 8); item += Schedule::kThreads) {
++            const int local_col = item / (BK / 8);
++            const int k8        = item - local_col * (BK / 8);
++            const int kk        = k0 + k8 * 8;
++            const int col       = col0 + local_col;
++            auto* dst = &Bs[(stage * BN + local_col) * BK +
++                            ternary_mma_swizzle(local_col, k8 * 8)];
++            if constexpr (Full) {
++                cp_async<16>(dst, &x[static_cast<std::int64_t>(col) * k + kk]);
++            } else {
++                if (col < cols && kk + 8 <= k) {
++                    cp_async<16>(dst, &x[static_cast<std::int64_t>(col) * k + kk]);
++                } else {
++                    *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
++                }
++            }
++        }
++    };
++
++    // A K tile is one or two halves of a 128-wide group, so its codes start at a byte offset
++    // inside the group and every row of the tile shares that group's single scale.
++    auto stage_quant = [&](int stage, int k_tile) {
++        const int group0   = (k_tile * BK) / Schedule::kGroupK;
++        const int byte0    = ((k_tile * BK) % Schedule::kGroupK) / 4;
++        constexpr int kChunks = CBT / 16;
++#pragma unroll 1
++        for (int item = tid; item < BM * kChunks; item += Schedule::kThreads) {
++            const int local_row = item / kChunks;
++            const int chunk     = item - local_row * kChunks;
++            const int row       = row0 + local_row;
++            auto* dst           = &Cr[(stage * BM + local_row) * CBT + chunk * 16];
++            if constexpr (Full) {
++                const std::int64_t gi = static_cast<std::int64_t>(row) * groups_per_row + group0;
++                cp_async<16>(dst, &codes[gi * Schedule::kGroupBytes + byte0 + chunk * 16]);
++            } else {
++                if (row < rows) {
++                    const std::int64_t gi =
++                        static_cast<std::int64_t>(row) * groups_per_row + group0;
++                    cp_async<16>(dst, &codes[gi * Schedule::kGroupBytes + byte0 + chunk * 16]);
++                } else {
++                    *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
++                }
++            }
++        }
++
++#pragma unroll 1
++        for (int local_row = tid; local_row < BM; local_row += Schedule::kThreads) {
++            const int row = row0 + local_row;
++            auto* dst     = &Sr[(stage * BM + local_row) * Schedule::kScaleBytes];
++            if (row < rows) {
++                const std::int64_t gi = static_cast<std::int64_t>(row) * groups_per_row + group0;
++                *reinterpret_cast<std::uint16_t*>(dst) =
++                    *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
++            } else {
++                *reinterpret_cast<std::uint16_t*>(dst) = 0;
++            }
++        }
++    };
++
++    auto stage_inputs = [&](int stage, int k_tile) {
++        stage_activation(stage, k_tile);
++        stage_quant(stage, k_tile);
++    };
++
++    // One warp decodes whole rows of A: lane l owns code byte l, which is weights 4l..4l+3. When
++    // the K tile is half a group there are only 16 bytes per row, so the warp splits into two
++    // 16-lane halves and covers two rows per step instead of idling half its lanes.
++    auto decode_weight = [&](int stage) {
++        constexpr int kStep = Schedule::kRowsPerDecodeStep;
++        for (int base = warp * kStep; base < BM; base += Schedule::kWarps * kStep) {
++            const int local_row = base + lane / CBT;
++            const int byte_col  = lane % CBT;
++            if (local_row >= BM) { continue; }
++            const std::uint8_t* codes_row = &Cr[(stage * BM + local_row) * CBT];
++            const std::uint16_t scale_bits =
++                *reinterpret_cast<const std::uint16_t*>(&Sr[(stage * BM + local_row) *
++                                                            Schedule::kScaleBytes]);
++            const __half2 scale2 = __half2half2(__ushort_as_half(scale_bits));
++
++            unsigned lo_bits = 0, hi_bits = 0;
++            ternary_mma_decode_byte(codes_row[byte_col], scale2, lo_bits, hi_bits);
++
++            const int base_col = 4 * byte_col;
++            auto* dst          = &As[local_row * BK];
++            *reinterpret_cast<unsigned*>(&dst[ternary_mma_swizzle(local_row, base_col)]) = lo_bits;
++            *reinterpret_cast<unsigned*>(&dst[ternary_mma_swizzle(local_row, base_col + 2)]) =
++                hi_bits;
++        }
++    };
++
++#pragma unroll
++    for (int stage = 0; stage < S; ++stage) {
++        if (stage < k_tiles) { stage_inputs(stage, stage); }
++        cp_commit();
++    }
++
++    for (int k_tile = 0; k_tile < k_tiles; ++k_tile) {
++        const int stage = k_tile % S;
++        cp_wait<S - 1>();
++        __syncthreads();
++
++        decode_weight(stage);
++        __syncthreads();
++
++        unsigned a_frag[MT][4];
++        unsigned b_frag[NT][2];
++#pragma unroll
++        for (int ki = 0; ki < KSUB; ++ki) {
++            const int ks = ki * 16;
++#pragma unroll
++            for (int mi = 0; mi < MT; ++mi) {
++                const int row = warp_row * WM + mi * 16 + a_row_offset;
++                const int col = ks + a_col_offset;
++                ldmatrix_x4(a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3],
++                            smem_addr(&As[row * BK + ternary_mma_swizzle(row, col)]));
++            }
++#pragma unroll
++            for (int ni = 0; ni < NT; ++ni) {
++                const int row = warp_col * WN + ni * 8 + b_inner_row;
++                const int col = ks + b_k_offset;
++                ldmatrix_x2(b_frag[ni][0], b_frag[ni][1],
++                            smem_addr(&Bs[(stage * BN + row) * BK +
++                                          ternary_mma_swizzle(row, col)]));
++            }
++#pragma unroll
++            for (int mi = 0; mi < MT; ++mi) {
++#pragma unroll
++                for (int ni = 0; ni < NT; ++ni) {
++                    mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
++                             accum[mi][ni][3], a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
++                             a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
++                }
++            }
++        }
++
++        __syncthreads();
++        const int prefetch_tile = k_tile + S;
++        if (prefetch_tile < k_tiles) { stage_inputs(stage, prefetch_tile); }
++        cp_commit();
++    }
++
++#pragma unroll
++    for (int mi = 0; mi < MT; ++mi) {
++        const int output_row0 = row0 + warp_row * WM + mi * 16 + mma_row;
++        const int output_row1 = output_row0 + 8;
++#pragma unroll
++        for (int ni = 0; ni < NT; ++ni) {
++            const int output_col0 = col0 + warp_col * WN + ni * 8 + 2 * mma_col;
++            const int output_col1 = output_col0 + 1;
++            const float* values   = accum[mi][ni];
++            auto store            = [&](int row, int col, float value) {
++                out[static_cast<std::int64_t>(col) * out_row_stride + row] =
++                    __float2bfloat16_rn(value);
++            };
++            if constexpr (Full) {
++                store(output_row0, output_col0, values[0]);
++                store(output_row0, output_col1, values[1]);
++                store(output_row1, output_col0, values[2]);
++                store(output_row1, output_col1, values[3]);
++            } else {
++                if (output_row0 < rows) {
++                    if (output_col0 < cols) { store(output_row0, output_col0, values[0]); }
++                    if (output_col1 < cols) { store(output_row0, output_col1, values[1]); }
++                }
++                if (output_row1 < rows) {
++                    if (output_col0 < cols) { store(output_row1, output_col0, values[2]); }
++                    if (output_col1 < cols) { store(output_row1, output_col1, values[3]); }
++                }
++            }
++        }
++    }
++}
++
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh b/src/ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh
+index ea111430..91e555b0 100644
+--- a/src/ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh
++++ b/src/ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh
+@@ -1,372 +1,407 @@
+-// PART OF the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
+-// NEW file, not present upstream; see patches/ in the release bundle for the change list,
+-// rebuild steps and required verification. Roll back with NINFER_TERNARY_MMA=0.
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++
+ #pragma once
+ 
+-// Ternary PQ2_0 tensor-core path for the small-T regime (T = 2..8) -- which is exactly the
+-// speculative VERIFY pass, T = draft + 1.
+-//
+-// WHY THIS EXISTS (measured, not assumed)
+-// The SIMT tile GEMV is INSTRUCTION-ISSUE bound at T > 1, not bandwidth bound. Its register
+-// footprint is 36 (tile<4>) against 40 for the T=1 GEMV, so occupancy is NOT the constraint --
+-// the handover's "extra accumulators cost registers and dropped the resident warp count" story
+-// does not hold. What actually scales with T is work per weight: one FMA per weight PER TOKEN,
+-// plus two activation loads and a bf16->f32 convert per token. Measured on a synthetic PQ2_0
+-// payload at N=248320, K=5120:
++// PQ2_0 RowSplit x BF16 tensor-core GEMV for the SPECULATIVE VERIFY pass (T = draft + 1, so 2..4).
+ //
+-//     T=1   gemv      0.652 ms   483 GiB/s     (the plain warp-per-row GEMV)
+-//     T=3   gemv_tile 1.493 ms   211 GiB/s     (2.29x the T=1 time, identical weight bytes)
+-//     T=3   reference 5.402 ms    60 GiB/s     (amortises well but 8x slower in absolute terms)
++// Why a second tensor-core entry point. The prefill kernel in ternary_rowsplit_mma.cuh tiles the
++// token axis at 128, which is right when T is a prefill chunk and wrong when T is 3: a 128-wide
++// output tile would be 97% empty. What the verify pass needs is the opposite shape -- all of K
++// inside one CTA, so the weights are read exactly once, with the token axis kept tiny.
+ //
+-// So the tile GEMV does reuse each weight across the tile, but pays a per-token instruction bill
+-// that eats the entire gain. The tensor core removes that bill: one mma.m16n8k16 covers
+-// 16 rows x 8 tokens x 16 k in ONE instruction, so every token in the tile rides the same weight
+-// read at zero extra instruction cost. Weights are decoded once per (row, k-byte) through a
+-// 256-entry shared LUT, which turns "one packed byte -> four ternary weights" into one LDS.64.
++// Skeleton follows q4_small_t_mma.cuh: the weight is the A operand and the activation is the B
++// operand, the CTA owns RowsPerCta output rows, and each of the eight warps takes one slice of K
++// and reduces at the end with a shared-memory tree.
+ //
+-// LAYOUT NOTES THAT ARE LOAD-BEARING (violate them and T == 1 still looks perfect):
+-//   * ninfer/ggml keep ne[0] contiguous, so an activation with ne=(k,T) is TOKEN-major: element
+-//     (column, token) lives at token*k + column. The mma B operand wants n rows of k with k
+-//     contiguous, so the activation tile is staged verbatim, with no transpose.
+-//   * the output is token-major as well: (row, token) at token*out_row_stride + row.
+-//   * PQ2_0 packs FOUR 2-bit codes per byte, and code c denotes weight value (c - 1). The group
+-//     scale is applied AFTER the mma, per row, because one group spans 8 mma k-steps.
++// Why the tensor cores matter here. The SIMT tile kernel this replaces is not slow because T is 3
++// -- measured, its cost is flat in T (1.572 ms at T=1 against 1.719 ms at T=4 on the 248320-row
++// head) because the weights are read once either way. It is slow because it leaves the card at
++// 196 GB/s, 31% of the measured ceiling, with FMA and decode both crowding the issue slots. On
++// that same head NCU put it at 95.47% achieved occupancy with ALU as the top pipe and no occupancy
++// left to buy. Tensors move the multiplies off the ALU pipe; that is the whole change.
+ //
+-// GEOMETRY: one warp owns 16 output rows and walks the whole K; the CTA is 8 warps, so a CTA
+-// covers 128 rows. Warps never cooperate, so there is no cross-warp reduction and no barrier
+-// beyond the shared staging handshake. K is consumed in 256-wide chunks (two PQ2_0 groups),
+-// double buffered with cp.async so the weight stream is not serialised behind the mma.
++// The one slice of the prefill kernel that is better here: because a warp takes exactly one
++// 128-wide quant group, the scale can be applied AFTER the K reduction, in fp32, instead of being
++// folded into each decoded weight. So the A operand is exactly {-1,0,+1} in bf16 -- no rounding at
++// all -- where the prefill path pays one mantissa bit for the same thing.
+ 
+ #include "ops/common/mma.cuh"
+-#include "ops/common/memory.cuh"
+-#include "ops/linear/ternary/ternary_rowsplit_storage.cuh"
++#include "ops/linear/ternary/ternary_rowsplit_mma.cuh"
+ 
+ #include <cuda_bf16.h>
+-#include <cuda_runtime.h>
++#include <cuda_fp16.h>
+ 
+ #include <cstdint>
+-#include <cstdlib>
+-#include <string>
+ 
+ namespace ninfer::ops::detail {
+ 
+-inline constexpr int kTernaryMmaRowsPerWarp     = 16;
+-inline constexpr int kTernaryMmaTokens          = 8;
+-// Warps (and therefore rows) per CTA. This is the knob that decides how many CTAs a narrow
+-// projection launches: a PQ2_0 weight is tiled 16 rows per warp, so with 8 warps a N=5120 projection
+-// gets only 40 CTAs and leaves half of this card's 80 SMs idle, measuring 322 GiB/s instead of the
+-// 618 GiB/s the same kernel reaches on the 272-CTA MLP shape. Four warps doubles the CTA count
+-// (N=5120 -> 80 CTAs, one per SM) at the cost of fewer resident warps per SM, which the cp.async
+-// pipeline is there to absorb.
+-inline constexpr int kTernaryMmaWarpsPerCta     = 4;
+-inline constexpr int kTernaryMmaRowsPerCta      = kTernaryMmaRowsPerWarp * kTernaryMmaWarpsPerCta;
+-inline constexpr int kTernaryMmaGroupK          = PQ2RowSplitStorage::kGroupK;
+-// K consumed per staged chunk. Doubling this from 256 to 512 halves both the number of
+-// __syncthreads pairs (two per chunk) and the number of times each CTA re-stages its activation
+-// tile -- the two overheads that keep this kernel at ~400 GiB/s against the ~540 GiB/s the T=1
+-// GEMV reaches on the same weights. The cost is more shared memory per CTA, so it is an empirical
+-// question, not an obvious win.
+-inline constexpr int kTernaryMmaChunkK          = 512;
+-inline constexpr int kTernaryMmaGroupsPerChunk  = kTernaryMmaChunkK / kTernaryMmaGroupK;
+-inline constexpr int kTernaryMmaKStepsPerChunk  = kTernaryMmaChunkK / 16;
+-inline constexpr int kTernaryMmaCodesPerRow     = kTernaryMmaChunkK / 4; // four codes per byte
+-inline constexpr int kTernaryMmaRowStride       = 144;                   // 128 used + pad
+-inline constexpr int kTernaryMmaActStride       = kTernaryMmaChunkK + 8; // 16B-aligned, padded
+-inline constexpr int kTernaryMmaStages          = 2;
+-inline constexpr int kTernaryMmaThreads         = kTernaryMmaWarpsPerCta * 32;
+-
+-static_assert((kTernaryMmaRowStride % 16) == 0, "cp.async needs a 16-byte aligned row start");
+-static_assert(kTernaryMmaRowStride >= kTernaryMmaCodesPerRow, "the row must hold a whole chunk");
+-static_assert((kTernaryMmaActStride % 8) == 0, "ldmatrix wants 8-element row starts");
+-static_assert((kTernaryMmaChunkK % kTernaryMmaGroupK) == 0, "chunks must be whole groups");
+-static_assert((kTernaryMmaChunkK % 16) == 0, "chunks must be whole mma k-steps");
+-
+-union TernaryMmaPairBits {
+-    __nv_bfloat162 pair;
+-    unsigned bits;
+-};
+-
+-// NINFER_TERNARY_MMA=0 forces the SIMT paths, which is the A/B switch for validating this kernel
+-// end to end on the real artifact.
++// One code byte -> two weights, exact, already in bf16.
++//
++// Differs from ternary_mma_decode_byte only in that it returns one pair instead of two and leaves
++// the group scale to the caller. The nibble select is by lane parity, because a m16n8k16 A
++// fragment wants columns 2l..2l+1 while a PQ2_0 byte holds columns 4b..4b+3: lanes 2k and 2k+1
++// read the same byte and take opposite halves. `nibble` is that parity.
++//
++// Two things here are load-bearing and easy to undo by accident:
++//
++// 1. The nibble select is a variable shift, not a ternary. Both halves assemble the same way --
++//    shift the wanted two-bit field down to bits 1:0, copy it to 1:0, and copy its neighbour to
++//    9:8 -- so `v >> 4*nibble` covers both and the branch disappears. Written as a conditional the
++//    compiler emits both arms plus a SEL, which is one extra instruction on a path that runs four
++//    times per K step.
+ //
+-// It is needed because the perplexity harness runs with --context 512, i.e. T = 512, which is far
+-// outside this kernel's 2..8 token window and therefore falls through to the reference kernel. A
+-// perplexity run with a window inside 2..8 IS covered here, so comparing the two values with the
+-// switch on and off is a direct numeric equivalence test of the tensor-core path on real weights
+-// rather than on a synthetic payload.
++// 2. The magic is bf16 at exponent 7, not fp16 and not bf16 at exponent 10. bf16 stores seven
++//    mantissa bits, so at exponent 7 its ULP is exactly 1: splicing the code into the mantissa's
++//    low bits gives 128 + c, whose bias byte is 0x00 -- so the splice needs no OR to prime it.
++//    One bf16 subtract of 129 gives c - 1 in {0,+/-1}, exactly, and the pair is already the width
++//    the mma wants. The prefill kernel's fp16 version instead lands on {0,+/-1} in half precision
++//    and pays two converts to get to bf16; the exponent-10 version lands on 8*(c-1) and pays an OR
++//    per pair plus a 1/8 premultiply on the scale. This costs neither.
+ //
+-// Read once: the choice decides whether a kernel appears in the captured CUDA graph at all, so it
+-// must not change between graph construction and replay (same rule as the rotation switch).
+-[[nodiscard]] inline bool ternary_mma_enabled() {
+-    static const bool enabled = [] {
+-        const char* value = std::getenv("NINFER_TERNARY_MMA");
+-        return value == nullptr || std::string(value) != "0";
+-    }();
+-    return enabled;
++// Worth ~8% on the verify shapes. The whole decode is 24% of the kernel -- measured by rebuilding
++// with the arithmetic compiled out, which puts 34816x5120 at 644 GB/s, this card's measured read
++// ceiling -- and this is what came off cheaply. What is left is the PRMT and the assembly.
++__device__ __forceinline__ unsigned ternary_small_t_decode_pair(std::uint32_t v, unsigned nibble) {
++    const unsigned t = v >> (nibble * 4);
++    const unsigned a = (t & 0x03u) | ((t & 0x0Cu) << 6);
++    constexpr unsigned kMagic = 0x43004300u; // bf16 0x4300 in both lanes: exponent of 128
++    constexpr unsigned kBias  = 0x43014301u; // bf16 129.0 in both lanes
++    const unsigned w          = __byte_perm(a, kMagic, 0x5150u);
++    const __nv_bfloat162 bias = *reinterpret_cast<const __nv_bfloat162*>(&kBias);
++    const __nv_bfloat162 h = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&w), bias);
++    return *reinterpret_cast<const unsigned*>(&h);
+ }
+ 
+-// Shared staging. The row strides are chosen so that the shared accesses in the hot loop are
+-// bank-conflict free, which is why they are not just the natural 64 / 256:
+-//   * codes: a whole k-step is one 4-byte word, and the four lanes of a quad read the SAME word,
+-//     so the only conflicts are between rows. With a 64-byte row stride the word offset is
+-//     16*row + kstep and rows collapse onto two banks; 80 bytes gives 20*row + kstep, whose
+-//     low five bits are distinct across the eight rows a single load touches.
+-//   * activations: ldmatrix pulls 16 bytes per row, so rows must start on distinct banks.
+-//     528 bytes = 132 words => 4 banks apart, which lands rows 0..7 on banks 0,4,...,28 exactly.
+-struct TernaryMmaStorage {
+-    uint2 lut[256];
+-    alignas(16) std::uint8_t codes[kTernaryMmaStages][kTernaryMmaWarpsPerCta]
+-                                  [kTernaryMmaRowsPerWarp][kTernaryMmaRowStride];
+-    alignas(16) __nv_bfloat16 act[kTernaryMmaStages][kTernaryMmaTokens][kTernaryMmaActStride];
+-    std::uint16_t scales[kTernaryMmaStages][kTernaryMmaWarpsPerCta][kTernaryMmaRowsPerWarp]
+-                        [kTernaryMmaGroupsPerChunk];
++// Rows per CTA is the lever that sets this kernel's load mix, and the ratio is not guessable from
++// the shape. Per K group a CTA stages
++//
++//     codes       = kRowsPerCta * kGroupK / 4        bytes, from DRAM (each row is read once)
++//     activations = kGroupK * live_cols * 2          bytes, from L2 (every CTA reads the same slice)
++//
++// so activations/codes = 8 * live_cols / kRowsPerCta. At 16 rows and 4 live tokens that is 2.0 --
++// the activations are TWICE the weight traffic -- and measured, four shapes with wildly different
++// grids (2176, 320, 384, 256 CTAs) and group counts (5, 17, 5, 5) all land on the same 1.3-1.6 TB/s
++// of COMBINED traffic. That is an L2 ceiling, not the measured 637 GB/s DRAM one, and it shows up
++// as DRAM rates of only 453-571 GB/s. Raising the row block to 32 takes the ratio to 1.0, which
++// puts the L2 ceiling at ~2x1.45 TB/s and leaves DRAM as the binding constraint again.
++//
++// The row block is a kernel template parameter rather than a member of a templated schedule
++// because templating the struct makes cudafe++ die outright under this build's -rdc=true
++// ("memory region allocation must not occur after front end processing has ended").
++struct TernarySmallTSchedule {
++    static constexpr int kKWarps            = 8;
++    static constexpr int kTileKPerWarp      = 128; // exactly one ternary quant group
++    static constexpr int kGroupK            = kKWarps * kTileKPerWarp;
++    static constexpr int kRowsPerCta        = 16;
++    static constexpr int kRowsPerLoaderWarp = kRowsPerCta / kKWarps;
++    static constexpr int kCodeBytesPerGroup = 32;
++    static constexpr int kCodeBytesPerWarp  = kTileKPerWarp / 4;
++    static constexpr int kCodeRowBytes      = kGroupK / 4;
++    // A row holds all eight warps' groups (8 x 32 bytes = 256). That is 64 four-byte words, and
++    // 64 % 32 == 0, so every row starts on the same bank: the eight lanes with distinct gid read
++    // the same byte column of eight different rows and collide eight ways. Padding by 16 bytes
++    // (keeping the 16-byte alignment cp_async needs) makes the row stride 272 = 4 mod 32 words,
++    // which spreads the eight rows over eight distinct banks. NCU before this: L1/TEX throughput
++    // 95.02% with DRAM at 43.89%.
++    static constexpr int kCodeStride = kCodeRowBytes + 16;
++    static constexpr int kThreads           = kKWarps * 32;
++    static constexpr int kMmaKSteps         = kTileKPerWarp / 16;
++
++    static_assert(kGroupK % 128 == 0, "the K slice per warp must be a whole number of groups");
++    static_assert(kRowsPerCta % kKWarps == 0, "rows per CTA must divide evenly over the warps");
++    static_assert(kCodeBytesPerWarp % 16 == 0, "group staging moves whole 16-byte chunks");
+ };
+ 
+-__global__ __launch_bounds__(kTernaryMmaThreads)
+-void ternary_pq2_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
+-                                    const std::uint8_t* __restrict__ codes,
+-                                    const std::uint8_t* __restrict__ scales,
+-                                    __nv_bfloat16* __restrict__ out, std::int32_t rows,
+-                                    std::int32_t k, std::int32_t tokens,
+-                                    std::int32_t out_row_stride) {
+-    // STATIC shared memory, deliberately not `extern __shared__`: the footprint is a compile-time
+-    // constant (32 KB, under the 48 KB per-block static cap), and declaring an extern shared
+-    // VARIABLE OF A NAMED AGGREGATE type emits a device symbol that nvlink then cannot resolve
+-    // ("nvlink error : Undefined reference to 'ninfer::ops::detail::shared'"). Static also removes
+-    // the need for a cudaFuncSetAttribute opt-in and for a size at every launch site.
+-    __shared__ TernaryMmaStorage staging;
+-    auto& lut      = staging.lut;
+-    auto& codes_sh = staging.codes;
+-    auto& act_sh   = staging.act;
+-    auto& scale_sh = staging.scales;
+-
+-    const int tid  = static_cast<int>(threadIdx.x);
+-    const int warp = tid >> 5;
+-    const int lane = tid & 31;
+-    const int gid  = lane >> 2; // 0..7  -- mma row within the fragment
+-    const int lid  = lane & 3;  // 0..3  -- mma k pair / column pair index
+-
+-    // ---- decode table: packed byte -> four ternary weights in bf16 ----------------------------
+-    // Every code c means value (c - 1), so the table holds exact signed integers and the multiply
+-    // is exact (no rounding: +-1 scaling in bf16 is a pure exponent/sign change).
+-    for (int i = tid; i < 256; i += kTernaryMmaThreads) {
+-        TernaryMmaPairBits low;
+-        TernaryMmaPairBits high;
+-        low.pair  = __floats2bfloat162_rn(static_cast<float>((i & 3) - 1),
+-                                         static_cast<float>(((i >> 2) & 3) - 1));
+-        high.pair = __floats2bfloat162_rn(static_cast<float>(((i >> 4) & 3) - 1),
+-                                          static_cast<float>(((i >> 6) & 3) - 1));
+-        uint2 entry;
+-        entry.x = low.bits;
+-        entry.y = high.bits;
+-        lut[i]  = entry;
+-    }
+-
+-    const int row0 = static_cast<int>(blockIdx.x) * kTernaryMmaRowsPerCta;
+-    if (row0 >= rows) { return; }
+-
+-    const std::int32_t groups_per_row = k / kTernaryMmaGroupK;
+-    const std::int64_t code_row_bytes =
+-        static_cast<std::int64_t>(groups_per_row) * PQ2RowSplitStorage::kCodeBytesPerGroup;
+-    const std::int64_t scale_row_bytes =
+-        static_cast<std::int64_t>(groups_per_row) * PQ2RowSplitStorage::kScaleBytesPerGroup;
+-    const std::int32_t chunks = k / kTernaryMmaChunkK;
+-
+-    const std::int64_t warp_row_base =
+-        static_cast<std::int64_t>(row0) + static_cast<std::int64_t>(warp) * kTernaryMmaRowsPerWarp;
+-
+-    // Stage one chunk: this warp's 16x64 code window, its scales, and (cooperatively) the
+-    // CTA-wide activation tile. Out-of-range rows are zero-filled rather than read, so a partial
+-    // CTA never touches global memory past the end of the weight.
++// TileCols is the token tile; mma n is 8, so 8 is the smallest useful value and is what the verify
++// pass (T <= 4) uses. A larger tile amortises the weight decode over more tokens.
++template <int TileCols, int LaunchBoundsMinBlocks,
++          int kRowsPerCta = TernarySmallTSchedule::kRowsPerCta>
++__launch_bounds__(TernarySmallTSchedule::kThreads, LaunchBoundsMinBlocks) __global__
++void ternary_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
++                                const std::uint8_t* __restrict__ codes,
++                                const std::uint8_t* __restrict__ scales,
++                                __nv_bfloat16* __restrict__ out, std::int32_t rows,
++                                std::int32_t k, std::int32_t tokens,
++                                std::int32_t out_row_stride) {
++    using Schedule = TernarySmallTSchedule;
++    static_assert(TileCols >= 8 && TileCols <= 32 && (TileCols % 8) == 0);
++    static_assert(kRowsPerCta % TernarySmallTSchedule::kKWarps == 0,
++                  "rows per CTA must divide evenly over the warps");
++
++    constexpr int kWarps     = Schedule::kKWarps;
++    constexpr int kTileK     = Schedule::kTileKPerWarp;
++    constexpr int kGroupK    = Schedule::kGroupK;
++    constexpr int kNt        = TileCols / 8;
++    constexpr int kMmaKSteps = Schedule::kMmaKSteps;
++    // mma m is 16, so one A-fragment pass covers exactly 16 output rows; a wider CTA owns several
++    // such row blocks and runs the SAME staged activations against each of them. That reuse is the
++    // entire point of the parameter -- activations are L2-resident and cost more of the load pipe
++    // than the codes do.
++    constexpr int kRowBlock   = 16;
++    constexpr int kRowBlocks  = kRowsPerCta / kRowBlock;
++    // Derived from the template parameter, NOT from Schedule: the schedule's own
++    // kRowsPerLoaderWarp is pinned at 16/8 and silently stages only half the rows when the
++    // kernel is instantiated at a wider row block. That reads as a 1.6x speedup with wrong
++    // output, which is exactly the shape of bug the harness comparison is here to catch.
++    constexpr int kRowsPerLoaderWarp = kRowsPerCta / kWarps;
++    static_assert((kRowsPerCta % kRowBlock) == 0, "rows per CTA must be a whole number of mma m-tiles");
++
++    union SharedStorage {
++        struct {
++            std::uint8_t codes[kRowsPerCta][Schedule::kCodeStride];
++            __nv_bfloat16 activations[kWarps][TileCols * kTileK];
++            std::uint16_t scales[kRowsPerCta][kWarps];
++        } staging;
++        float partial[kRowBlocks * kWarps * kNt * 32 * 4];
++    };
++    __shared__ __align__(16) SharedStorage shared;
++    auto& code_shared  = shared.staging.codes;
++    auto& x_shared     = shared.staging.activations;
++    auto& scale_shared = shared.staging.scales;
++
++    const int tid   = static_cast<int>(threadIdx.x);
++    const int warp  = tid >> 5;
++    const int lane  = tid & 31;
++    const int gid   = lane >> 2;
++    const int lid   = lane & 3;
++    const int row0  = static_cast<int>(blockIdx.x) * kRowsPerCta;
++    const int k_groups = k / kGroupK;
++    const int groups_per_row = k / 128;
++
++    // Columns at or past the real token count are never stored by the epilogue, so staging them
++    // every group is pure waste -- and it is the larger half of the staging. A warp stages
++    // TileCols columns of its 128-wide K slice per group, so at T=3 the mma's eight-wide n axis
++    // makes five of those columns dead: 10 KB of the 16 KB a CTA moves per group, and it is
++    // re-moved on every one of the k/1024 group iterations. Measured on the 5120x17408 shape,
++    // small_t16 costs 30% more than small_t8 while doing identical work, which is this term.
+     //
+-    // `tok_base` selects which tile of kTernaryMmaTokens tokens this staging is for. A CTA walks
+-    // the whole sequence in such tiles, which is what lets one kernel serve both the 2..8 token
+-    // speculative verify pass and a full prefill, instead of falling back to the reference kernel
+-    // above 8 tokens -- the fallback that made prefill measure 55 tok/s against 412-437 for the
+-    // non-ternary engine.
+-    const auto stage = [&](int buf, int chunk, int tok_base) {
+-        const std::int64_t chunk_byte =
+-            static_cast<std::int64_t>(chunk) * kTernaryMmaCodesPerRow;
+-        const std::int64_t chunk_k = static_cast<std::int64_t>(chunk) * kTernaryMmaChunkK;
++    // The dead columns still have to hold *something* the mma can read, so they are zeroed once
++    // before the group loop. They are outside the staging loop from then on, so the zero survives
++    // every group and no stale value from a previous kernel can reach an mma operand.
++    const int live_cols = tokens < TileCols ? tokens : TileCols;
++    constexpr int kItemsPerSplit = TileCols * (kTileK / 8);
++    if (live_cols < TileCols) {
++        for (int item = lane; item < kItemsPerSplit; item += 32) {
++            const int col = item / (kTileK / 8);
++            const int k8  = item - col * (kTileK / 8);
++            if (col >= live_cols) {
++                *reinterpret_cast<int4*>(
++                    &x_shared[warp][col * kTileK + ternary_mma_swizzle(col, k8 * 8)]) =
++                    make_int4(0, 0, 0, 0);
++            }
++        }
++    }
+ 
+-        // Codes: kTernaryMmaCodesPerRow bytes per row, moved as 16-byte copies filled round-robin
+-        // across the lanes. Written generically on purpose -- sizing this loop by hand for one
+-        // chunk width silently stages only PART of each row at another width, which presents as a
+-        // suspiciously fast kernel that produces garbage (all four correctness checks went to NaN).
+-        constexpr int kCopiesPerRow  = kTernaryMmaCodesPerRow / 16;
+-        constexpr int kCopiesPerWarp = kTernaryMmaRowsPerWarp * kCopiesPerRow;
+-#pragma unroll
+-        for (int copy = lane; copy < kCopiesPerWarp; copy += 32) {
+-            const int local_row           = copy / kCopiesPerRow;
+-            const int byte_off            = (copy % kCopiesPerRow) * 16;
+-            const std::int64_t global_row = warp_row_base + local_row;
+-            std::uint8_t* dst             = &codes_sh[buf][warp][local_row][byte_off];
+-            if (global_row < rows) {
+-                cp_async<16, Cache::cg>(
+-                    dst, codes + global_row * code_row_bytes + chunk_byte + byte_off);
++    const auto stage_x = [&](int group_k0) {
++        const int items = live_cols * (kTileK / 8);
++#pragma unroll 1
++        for (int item = lane; item < items; item += 32) {
++            const int col = item / (kTileK / 8);
++            const int k8  = item - col * (kTileK / 8);
++            auto* dst     = &x_shared[warp][col * kTileK + ternary_mma_swizzle(col, k8 * 8)];
++            const int kk  = group_k0 + warp * kTileK + k8 * 8;
++            if (kk + 8 <= k) {
++                cp_async<16>(dst, &x[static_cast<std::int64_t>(col) * k + kk]);
+             } else {
+-                store_vec<std::uint8_t, uint4>(dst, make_uint4(0u, 0u, 0u, 0u));
++                *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+             }
+         }
++    };
+ 
+-        { // scales: one entry per (row, group-in-chunk) -- 16 x 4 at a 512-wide chunk
+-            constexpr int kScaleEntries = kTernaryMmaRowsPerWarp * kTernaryMmaGroupsPerChunk;
++    // Codes are shared by every warp: each warp decodes a different 128-wide group out of the same
++    // staged rows, so ONE row of code_shared holds all eight groups (kCodeRowBytes = 256) and the
++    // warps split the staging by row rather than by column.
++    const auto stage_weight = [&](int group_k0) {
++        constexpr int kChunksPerRow = Schedule::kCodeRowBytes / 16;
+ #pragma unroll
+-            for (int entry = lane; entry < kScaleEntries; entry += 32) {
+-                const int local_row           = entry / kTernaryMmaGroupsPerChunk;
+-                const int group_in_chunk      = entry % kTernaryMmaGroupsPerChunk;
+-                const std::int64_t global_row = warp_row_base + local_row;
+-                std::uint16_t value           = 0u;
+-                if (global_row < rows) {
+-                    value = load_vec<std::uint16_t>(
+-                        scales + global_row * scale_row_bytes +
+-                        (static_cast<std::int64_t>(chunk) * kTernaryMmaGroupsPerChunk +
+-                         group_in_chunk) *
+-                            PQ2RowSplitStorage::kScaleBytesPerGroup);
+-                }
+-                scale_sh[buf][warp][local_row][group_in_chunk] = value;
++        for (int item = lane; item < kRowsPerLoaderWarp * kChunksPerRow; item += 32) {
++            const int row_item = item / kChunksPerRow;
++            const int chunk    = item - row_item * kChunksPerRow;
++            const int row      = warp * kRowsPerLoaderWarp + row_item;
++            const int grow     = row0 + row;
++            auto* dst          = &code_shared[row][chunk * 16];
++            if (grow < rows) {
++                cp_async<16>(dst, &codes[static_cast<std::int64_t>(grow) * groups_per_row *
++                                            Schedule::kCodeBytesPerGroup +
++                                        group_k0 / 4 + chunk * 16]);
++            } else {
++                *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+             }
+         }
+-
+-        { // activation tile: 8 tokens x 256 k, staged cooperatively by the whole CTA.
+-            // Written as a stride loop rather than `tok = tid >> 5` so it stays correct for any
+-            // warp count: with 4 warps that expression would only ever cover tokens 0..3.
+-            // These offsets are in bf16 ELEMENTS, not bytes: x is a __nv_bfloat16* while the code
+-            // staging above is byte-based because `codes` is a std::uint8_t*. A byte offset here
+-            // over-advances the source window by 2x and walks past the end of each token's row,
+-            // which presents as "values plausible but wrong, NaN at the tail" rather than as a
+-            // clean bounds error.
+-            // 16 bytes (8 bf16) per cp.async, and a chunk is kTernaryMmaChunkK elements per token,
+-            // so the number of copies a lane issues scales with the chunk width -- at 512 each lane
+-            // covers an element offset and that offset + 256.
+-            for (int tok = warp; tok < kTernaryMmaTokens; tok += kTernaryMmaWarpsPerCta) {
+-                const int global_tok = tok_base + tok;
+-                // Tokens past the end of the sequence are zero-filled (src_bytes 0 reads nothing),
+-                // so the mma sees a defined activation and the guarded store drops the result.
+-                const int safe_tok = (global_tok < tokens) ? global_tok : tok_base;
+-                for (int elem = lane * 8; elem < kTernaryMmaChunkK; elem += 32 * 8) {
+-                    cp_async_zfill<16>(
+-                        &act_sh[buf][tok][elem],
+-                        x + static_cast<std::int64_t>(safe_tok) * k + chunk_k + elem,
+-                        (global_tok < tokens) ? 16 : 0);
+-                }
++        // One 16-byte load covers the eight consecutive groups the eight warps each need.
++        for (int row = tid; row < kRowsPerCta; row += Schedule::kThreads) {
++            const int grow = row0 + row;
++            auto* dst      = &scale_shared[row][0];
++            if (grow < rows && group_k0 / 128 + kWarps <= groups_per_row) {
++                cp_async<16>(dst, &scales[(static_cast<std::int64_t>(grow) * groups_per_row +
++                                           group_k0 / 128) *
++                                          2]);
++            } else {
++                *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+             }
+         }
+     };
+ 
+-    // Walk the sequence in tiles of kTernaryMmaTokens tokens.
+-    //
+-    // The weight window is re-staged for every tile, because accumulators for the whole sequence
+-    // would not fit in registers. That amortises each weight read across kTernaryMmaTokens tokens
+-    // -- the same factor the reference kernel gets from its 8-token tile, but through a kernel that
+-    // sustains ~400 GiB/s instead of ~60 GiB/s. Above 8 tokens this replaces a fallback that cost
+-    // prefill a factor of ~8 against the non-ternary engine.
+-    const int row_lo = row0 + warp * kTernaryMmaRowsPerWarp + gid;
+-    const int row_hi = row_lo + 8;
+-
+-    for (int tok_base = 0; tok_base < tokens; tok_base += kTernaryMmaTokens) {
+-        float acc0 = 0.0f;
+-        float acc1 = 0.0f;
+-        float acc2 = 0.0f;
+-        float acc3 = 0.0f;
++    const int b_rin     = lane & 7;
++    const int b_koff    = ((lane >> 3) & 1) << 3;
++    float acc[kRowBlocks][kNt][4] = {};
+ 
+-        stage(0, 0, tok_base);
+-        cp_commit();
+-
+-        for (int chunk = 0; chunk < chunks; ++chunk) {
+-            const int buf = chunk & 1;
+-
+-            if (chunk + 1 < chunks) {
+-                stage(buf ^ 1, chunk + 1, tok_base);
+-                cp_commit();
+-                cp_wait<1>(); // chunk `buf` has landed; chunk+1 may still be in flight
+-            } else {
+-                cp_wait<0>();
+-            }
+-            __syncthreads();
++    stage_weight(0);
++    stage_x(0);
++    cp_commit();
++    cp_wait<0>();
++    __syncthreads();
+ 
+ #pragma unroll 1
+-        for (int group_in_chunk = 0; group_in_chunk < kTernaryMmaGroupsPerChunk;
+-             ++group_in_chunk) {
+-            float g0 = 0.0f;
+-            float g1 = 0.0f;
+-            float g2 = 0.0f;
+-            float g3 = 0.0f;
++    for (int gi = 0; gi < k_groups; ++gi) {
++        const int group_k0      = gi * kGroupK;
+ 
+ #pragma unroll
+-            for (int step = 0; step < 8; ++step) {
+-                const int kstep    = group_in_chunk * 8 + step;
+-                const int word_off = kstep * 4; // one k-step of 16 codes == one 4-byte word
++        for (int rb = 0; rb < kRowBlocks; ++rb) {
++        const int r0            = rb * kRowBlock;
++        float group_acc[kNt][4] = {};
++
++        // This lane's two code rows and its byte column within them, hoisted out of the K loop so
++        // that with the K axis unrolled every offset is a compile-time constant.
++        //
++        // The decode below is 24% of this kernel, measured by rebuilding with the arithmetic
++        // compiled out (gate_up then runs at 644 GB/s, the card's measured ceiling -- so the
++        // memory path is not what is left). Two ways to take more of it were tried and both lost:
++        // slicing whole words in registers instead of loading bytes, which trades two LDS for four
++        // shifts and costs 6% (0.055 against 0.052 on 5120x17408), and hoisting these row pointers
++        // still further, which changed nothing at all because nvcc had already done it. What
++        // remains is the byte assembly plus the perm, four times per K step, and it is issue-bound.
++        const std::uint8_t* const code_lo = &code_shared[r0 + gid][0];
++        const std::uint8_t* const code_hi = &code_shared[r0 + gid + 8][0];
++        const unsigned nibble = lid & 1;
++        const int coff0       = warp * Schedule::kCodeBytesPerWarp + (lid >> 1);
+ 
+-                // A operand: rows gid and gid+8, each contributing k and k+8 pairs.
+-                const unsigned word_lo =
+-                    load_vec<unsigned>(&codes_sh[buf][warp][gid][word_off]);
+-                const unsigned word_hi =
+-                    load_vec<unsigned>(&codes_sh[buf][warp][gid + 8][word_off]);
+-                const unsigned shift_near = 8u * static_cast<unsigned>(lid >> 1);
+-                const unsigned shift_far  = 8u * static_cast<unsigned>((lid >> 1) + 2);
+-
+-                const uint2 near_lo = lut[(word_lo >> shift_near) & 0xFFu];
+-                const uint2 far_lo  = lut[(word_lo >> shift_far) & 0xFFu];
+-                const uint2 near_hi = lut[(word_hi >> shift_near) & 0xFFu];
+-                const uint2 far_hi  = lut[(word_hi >> shift_far) & 0xFFu];
+-
+-                // A quad of lanes shares a byte; lanes with an odd lid need its high code pair.
+-                const bool odd = (lid & 1) != 0;
+-                const unsigned a0 = odd ? near_lo.y : near_lo.x;
+-                const unsigned a1 = odd ? near_hi.y : near_hi.x;
+-                const unsigned a2 = odd ? far_lo.y : far_lo.x;
+-                const unsigned a3 = odd ? far_hi.y : far_hi.x;
+-
+-                // B operand: the activation tile is already n-major (token rows, k contiguous),
+-                // which is exactly the .col layout the mma wants -- no transpose needed.
+-                unsigned bf0 = 0u;
+-                unsigned bf1 = 0u;
++#pragma unroll
++        for (int ks = 0; ks < kMmaKSteps; ++ks) {
++            // A fragment: lane (gid, lid) needs rows gid and gid+8, columns 2*lid (already in the
++            // low or high nibble of the byte) and 2*lid+8 (two bytes further along the row).
++            // The warp offset is what selects this warp's own group out of the shared row.
++            const int coff     = coff0 + ks * 4;
++            const unsigned af0 = ternary_small_t_decode_pair(code_lo[coff], nibble);
++            const unsigned af1 = ternary_small_t_decode_pair(code_hi[coff], nibble);
++            const unsigned af2 = ternary_small_t_decode_pair(code_lo[coff + 2], nibble);
++            const unsigned af3 = ternary_small_t_decode_pair(code_hi[coff + 2], nibble);
++#pragma unroll
++            for (int nt = 0; nt < kNt; ++nt) {
++                unsigned bf0, bf1;
++                const int br = nt * 8 + b_rin;
+                 ldmatrix_x2(bf0, bf1,
+-                            smem_addr(&act_sh[buf][lane & 7]
+-                                            [kstep * 16 + ((lane >> 3) & 1) * 8]));
+-
+-                mma_bf16(g0, g1, g2, g3, a0, a1, a2, a3, bf0, bf1);
++                            smem_addr(&x_shared[warp][br * kTileK +
++                                                    ternary_mma_swizzle(br, ks * 16 + b_koff)]));
++                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
++                         af0, af1, af2, af3, bf0, bf1);
+             }
++        }
+ 
+-            // One PQ2_0 group spans eight k-steps, so its scale is applied once, per row.
+-            const float top = __half2float(
+-                __ushort_as_half(scale_sh[buf][warp][gid][group_in_chunk]));
+-            const float bottom = __half2float(
+-                __ushort_as_half(scale_sh[buf][warp][gid + 8][group_in_chunk]));
+-            acc0 = fmaf(g0, top, acc0);
+-            acc1 = fmaf(g1, top, acc1);
+-            acc2 = fmaf(g2, bottom, acc2);
+-            acc3 = fmaf(g3, bottom, acc3);
++        // The warp owned exactly one group, so its scale is a single fp32 multiply after the K
++        // reduction -- and the weights it multiplied against were exact.
++        const float top_scale =
++            __half2float(__ushort_as_half(scale_shared[r0 + gid][warp]));
++        const float bot_scale =
++            __half2float(__ushort_as_half(scale_shared[r0 + gid + 8][warp]));
++#pragma unroll
++        for (int nt = 0; nt < kNt; ++nt) {
++            acc[rb][nt][0] = fmaf(group_acc[nt][0], top_scale, acc[rb][nt][0]);
++            acc[rb][nt][1] = fmaf(group_acc[nt][1], top_scale, acc[rb][nt][1]);
++            acc[rb][nt][2] = fmaf(group_acc[nt][2], bot_scale, acc[rb][nt][2]);
++            acc[rb][nt][3] = fmaf(group_acc[nt][3], bot_scale, acc[rb][nt][3]);
+         }
++        } // row block
+ 
+-            __syncthreads(); // the next stage reuses this buffer
++        if (gi + 1 < k_groups) {
++            __syncthreads();
++            stage_weight(group_k0 + kGroupK);
++            stage_x(group_k0 + kGroupK);
++            cp_commit();
++            cp_wait<0>();
++            __syncthreads();
+         }
++    }
+ 
+-        // C fragment: c0/c1 are rows gid, columns 2*lid / 2*lid+1; c2/c3 are rows gid+8.
+-        const int token_a = tok_base + 2 * lid;
+-        const int token_b = token_a + 1;
++    __syncthreads();
++    auto* partial = shared.partial;
++    // partial is indexed [rb][warp][kNt][lane], so each row block reduces over the same eight
++    // warps independently. The tree is otherwise untouched -- only the slot addressing moved.
++    const auto pslot = [&](int rb, int w, int nt) {
++        return partial + (((rb * kWarps + w) * kNt + nt) * 32 + lane) * 4;
++    };
+ 
+-        if (row_lo < rows) {
+-            if (token_a < tokens) {
+-                out[static_cast<std::int64_t>(token_a) * out_row_stride + row_lo] =
+-                    __float2bfloat16_rn(acc0);
++#pragma unroll
++    for (int rb = 0; rb < kRowBlocks; ++rb) {
++        if ((warp & 1) != 0) {
++#pragma unroll
++            for (int nt = 0; nt < kNt; ++nt) {
++                store_vec(pslot(rb, warp, nt),
++                          make_float4(acc[rb][nt][0], acc[rb][nt][1], acc[rb][nt][2],
++                                      acc[rb][nt][3]));
+             }
+-            if (token_b < tokens) {
+-                out[static_cast<std::int64_t>(token_b) * out_row_stride + row_lo] =
+-                    __float2bfloat16_rn(acc1);
++        }
++    }
++    __syncthreads();
++
++#pragma unroll
++    for (int rb = 0; rb < kRowBlocks; ++rb) {
++        if ((warp & 1) == 0) {
++#pragma unroll
++            for (int nt = 0; nt < kNt; ++nt) {
++                const float4 partner = load_vec<float4>(pslot(rb, warp + 1, nt));
++                acc[rb][nt][0] += partner.x;
++                acc[rb][nt][1] += partner.y;
++                acc[rb][nt][2] += partner.z;
++                acc[rb][nt][3] += partner.w;
++                if (warp != 0) {
++                    store_vec(pslot(rb, warp, nt),
++                              make_float4(acc[rb][nt][0], acc[rb][nt][1], acc[rb][nt][2],
++                                          acc[rb][nt][3]));
++                }
+             }
+         }
+-        if (row_hi < rows) {
+-            if (token_a < tokens) {
+-                out[static_cast<std::int64_t>(token_a) * out_row_stride + row_hi] =
+-                    __float2bfloat16_rn(acc2);
++    }
++    __syncthreads();
++
++    if (warp == 0) {
++#pragma unroll
++        for (int rb = 0; rb < kRowBlocks; ++rb) {
++#pragma unroll
++        for (int nt = 0; nt < kNt; ++nt) {
++            float4 sum = make_float4(acc[rb][nt][0], acc[rb][nt][1], acc[rb][nt][2],
++                                     acc[rb][nt][3]);
++#pragma unroll
++            for (int split = 2; split < kWarps; split += 2) {
++                const float4 value = load_vec<float4>(pslot(rb, split, nt));
++                sum.x += value.x;
++                sum.y += value.y;
++                sum.z += value.z;
++                sum.w += value.w;
++            }
++            const int col0 = nt * 8 + 2 * lid;
++            const int row_lo = row0 + rb * kRowBlock + gid;
++            const int row_hi = row0 + rb * kRowBlock + gid + 8;
++            if (col0 < tokens && row_lo < rows) {
++                out[static_cast<std::int64_t>(col0) * out_row_stride + row_lo] =
++                    __float2bfloat16_rn(sum.x);
++            }
++            if (col0 < tokens && row_hi < rows) {
++                out[static_cast<std::int64_t>(col0) * out_row_stride + row_hi] =
++                    __float2bfloat16_rn(sum.z);
++            }
++            if (col0 + 1 < tokens && row_lo < rows) {
++                out[static_cast<std::int64_t>(col0 + 1) * out_row_stride + row_lo] =
++                    __float2bfloat16_rn(sum.y);
+             }
+-            if (token_b < tokens) {
+-                out[static_cast<std::int64_t>(token_b) * out_row_stride + row_hi] =
+-                    __float2bfloat16_rn(acc3);
++            if (col0 + 1 < tokens && row_hi < rows) {
++                out[static_cast<std::int64_t>(col0 + 1) * out_row_stride + row_hi] =
++                    __float2bfloat16_rn(sum.w);
+             }
+         }
++        } // row block
+     }
+ }
+ 
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cu b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+index e7364b7b..7cf39c0e 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cu
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+@@ -6,6 +6,7 @@
+ #include <cuda_bf16.h>
+ 
+ #include <cstdint>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <type_traits>
+ 
+@@ -66,6 +67,18 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++// Residency target for the record kernel. See the note on the kernel itself: it moves ~148 MB of
++// state a round at 265 GB/s, and the question is whether that is a register/occupancy limit or the
++// serial dependency chain of the recurrence. Env-selectable so one build can answer it.
++int record_min_blocks() {
++    static const int mb = [] {
++        const char* value = std::getenv("NINFER_GDN_RECORD_MINBLOCKS");
++        const int parsed  = value == nullptr ? 0 : std::atoi(value);
++        return (parsed == 2 || parsed == 6 || parsed == 8) ? parsed : 2;
++    }();
++    return mb;
++}
++
+ template <bool Masked>
+ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
+                                    const Tensor& g, const Tensor& beta, float scale,
+@@ -97,7 +110,11 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
+         state_slot_stride,
+         scale,
+     };
+-    recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
++    switch (record_min_blocks()) {
++    case 6: recurrent_record_kernel<Masked, 6><<<grid, block, 0, stream>>>(access); break;
++    case 8: recurrent_record_kernel<Masked, 8><<<grid, block, 0, stream>>>(access); break;
++    default: recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access); break;
++    }
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cuh b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+index a10cbcb0..2a05811c 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cuh
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+@@ -672,8 +672,29 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+     store_state_tile(state, access.state_write_base(coord), coord);
+ }
+ 
+-template <bool Masked>
+-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
++// kMinBlocks is a knob rather than the file's constant 2 because the obvious suspicion here was
++// residency, and it has now been measured: it is WRONG.
++//
++// This kernel reads a whole layer's recurrent state (kValueHeads * kStateDim^2 floats) to produce
++// the per-token records -- about 148 MB a round over 48 launches -- and it moves that at 265 GB/s,
++// 42% of the card's measured ceiling. ptxas picks 112 registers under launch_bounds(..., 2), which
++// caps residency at four 128-thread blocks per SM, 16 of 48 warps, so occupancy looked like the
++// constraint. Forcing it down (verified with cuobjdump, no spills in either arm) and re-running
++// the engine twice gives:
++//
++//     minblocks=2  REG:112  16 warps/SM   100.8 / 100.5 tok/s
++//     minblocks=6  REG:80   24 warps/SM   100.4 / 100.2
++//     minblocks=8  REG:64   32 warps/SM    99.3 /  99.2
++//
++// Monotone in the wrong direction, consistently across both passes, acceptance bit-identical. The
++// kernel is limited by the dependency chain in run_recurrent_sequence -- the accepted tokens are
++// walked in order, each step needing the previous state -- so extra warps only idle, while the
++// registers ptxas gives up to make room for them cost more than the residency buys. Same shape of
++// result as kBlockMinCtasPerSm in the ternary gemv, and the same conclusion: default 2, do not
++// raise it. The switch is kept so the next person can re-run the A/B rather than re-add the arm.
++// 4 is deliberately absent -- it caps registers at 128, which ptxas already satisfies at 112.
++template <bool Masked, int kMinBlocks = 2>
++__global__ void __launch_bounds__(kWarpSize* kNumWarps, kMinBlocks)
+     recurrent_record_kernel(RecordAccess<Masked> access) {
+     const RecurrentCoordinates coord = access.coordinates();
+     const std::int32_t valid         = access.active_columns(coord);
+diff --git a/src/ops/linear_topk/q4_m64.cu b/src/ops/linear_topk/q4_m64.cu
+index 1e20ec56..d9895541 100644
+--- a/src/ops/linear_topk/q4_m64.cu
++++ b/src/ops/linear_topk/q4_m64.cu
+@@ -8,6 +8,7 @@
+ 
+ #include <cub/warp/warp_merge_sort.cuh>
+ 
++#include <cuda_bf16.h>
+ #include <cstdint>
+ #include <stdexcept>
+ 
