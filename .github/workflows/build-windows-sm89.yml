@@ -3,7 +3,7 @@ name: Windows Build (Ada sm_89)
 on:
   workflow_dispatch:
   push:
-    branches: [ "master", "main", "ada-sm89", "cranebw-v1.0.8", "official-4090w-sm89" ]
+    branches: [ "master", "main", "ada-sm89", "cranebw-v1.0.8", "official-4090w-sm89", "official-4090w-a3-sm89" ]
 
 env:
   VSLANG: "1033"
