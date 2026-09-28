@@ -3,7 +3,7 @@ name: Windows Build (Ada sm_89, r12 + A3)
 on:
   workflow_dispatch:
   push:
-    branches: [ "master", "main", "r12-a3-sm89" ]
+    branches: [ "master", "main", "r12-a3-sm89", "r12-a3-ppl" ]
 
 env:
   VSLANG: "1033"

@@ -416,6 +416,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+        // The ternary output head folds its activation into the rotated basis before the matmul,
+        // which needs a [hidden, T] BF16 scratch; linear.cpp states the same capacity for the
+        // PQ2_0/PTQ1_0 cases and warns that omitting it makes every ternary weight die in
+        // "linear workspace: unsupported weight qtype". Without this line the scoring pass runs
+        // out of workspace on the first window and the tool dies with bad_alloc.
+        scratch(causal_score, ops::detail::ternary_rotation_workspace_bytes(
+                                  TextConfig::hidden,
+                                  static_cast<std::int32_t>(kCausalScoreTile)));
         out.causal_score = finish(causal_score);
     }
 
