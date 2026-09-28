@@ -1,3 +1,5 @@
+#include <cstdio>
+
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
@@ -7,6 +9,7 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
+#include "ops/linear/ternary/ternary_rotation.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
@@ -1068,9 +1071,18 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
 
     try {
         state = state_store->reserve_reset(device.stream);
-        if (!state) { throw std::bad_alloc(); }
+        if (!state) {
+            std::fprintf(stderr, "[causal-score] state_store reserve_reset failed (no free slot)\n");
+            throw std::bad_alloc();
+        }
         address = text_kv_addresses->create_active(entitlement, 0);
-        if (!address) { throw std::bad_alloc(); }
+        if (!address) {
+            std::fprintf(stderr,
+                         "[causal-score] KV address refused: entitlement %u pages, "
+                         "predictor_count %u, token_count %u\n",
+                         entitlement, predictor_count, token_count);
+            throw std::bad_alloc();
+        }
         if (text_kv_addresses->bound_row(*address) != 0) {
             throw std::logic_error("causal score did not bind the unique Main KV row");
         }
@@ -1085,6 +1097,15 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
             work.reset();
             mark_workspace_usage(workspace_plan.causal_score);
             const auto columns = static_cast<std::int32_t>(staged_columns);
+            std::fprintf(stderr,
+                         "[causal-score] flush columns=%d plan=%zu B arena cap=%zu B used=%zu B "
+                         "peak=%zu B | logits %zu B + rotation %zu B\n",
+                         columns, workspace_plan.causal_score, work.capacity(), work.used(),
+                         work.peak_used(),
+                         static_cast<std::size_t>(TextConfig::output_rows) *
+                             static_cast<std::size_t>(columns) * sizeof(std::uint16_t),
+                         ops::detail::ternary_rotation_workspace_bytes(
+                             TextConfig::hidden, static_cast<std::int32_t>(columns)));
             Tensor logits      = work.alloc(DType::BF16, {TextConfig::output_rows, columns});
             Tensor target_ids  = work.alloc(DType::I32, {columns});
             Tensor logprobs    = work.alloc(DType::FP32, {columns});
@@ -9447,7 +9468,23 @@ detail::PhysicalResources ProgramImplCore::admission_capacity() const noexcept {
 
 bool ProgramImplCore::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
     if (base.impl_ == nullptr) { return false; }
-    const detail::PhysicalResources capacity = admission_capacity();
+    // PREFILL ADMISSION HEADROOM (2026-09-28). A request's demand accounts for every KV page its
+    // prompt and its output need, but prefill writes one whole chunk per step: the step that
+    // finishes a full pool still asks for prefill_chunk more pages, and there are none left.
+    // The KVMem capacity recovery path treats that shortfall as fatal, and because it throws
+    // from inside the worker, the worker's catch(...) fail-stops the engine -- every later
+    // request then answers 503 until the process is restarted. Measured on a 12 GB card with a
+    // full 131072 pool: a 130,380 token prompt died at cursor=1024 with free=14 need=16.
+    // Keeping that chunk out of the admission budget makes such a request PermanentlyInfeasible,
+    // which the engine already reports as a clean per-request ContextLengthExceeded.
+    detail::PhysicalResources capacity = admission_capacity();
+    {
+        const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t headroom_pages = (prefill_chunk + page_size - 1U) / page_size;
+        capacity.device.main_kv_pages = capacity.device.main_kv_pages > headroom_pages
+                                            ? capacity.device.main_kv_pages - headroom_pages
+                                            : 0U;
+    }
     const auto fits                          = [](detail::PhysicalResources value,
                          detail::PhysicalResources limit) noexcept {
         return value.device.active_lanes <= limit.device.active_lanes &&
@@ -9485,7 +9522,23 @@ bool ProgramImplCore::persistent_backfill_safe(
     }
     borrowers = checked_resource_sum(borrowers, candidate.impl_->demand.active_entitlement);
 
-    const detail::PhysicalResources capacity = admission_capacity();
+    // PREFILL ADMISSION HEADROOM (2026-09-28). A request's demand accounts for every KV page its
+    // prompt and its output need, but prefill writes one whole chunk per step: the step that
+    // finishes a full pool still asks for prefill_chunk more pages, and there are none left.
+    // The KVMem capacity recovery path treats that shortfall as fatal, and because it throws
+    // from inside the worker, the worker's catch(...) fail-stops the engine -- every later
+    // request then answers 503 until the process is restarted. Measured on a 12 GB card with a
+    // full 131072 pool: a 130,380 token prompt died at cursor=1024 with free=14 need=16.
+    // Keeping that chunk out of the admission budget makes such a request PermanentlyInfeasible,
+    // which the engine already reports as a clean per-request ContextLengthExceeded.
+    detail::PhysicalResources capacity = admission_capacity();
+    {
+        const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t headroom_pages = (prefill_chunk + page_size - 1U) / page_size;
+        capacity.device.main_kv_pages = capacity.device.main_kv_pages > headroom_pages
+                                            ? capacity.device.main_kv_pages - headroom_pages
+                                            : 0U;
+    }
     const auto fits                          = [](detail::PhysicalResources value,
                          detail::PhysicalResources limit) noexcept {
         return value.device.active_lanes <= limit.device.active_lanes &&
