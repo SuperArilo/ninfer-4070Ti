@@ -1,0 +1,113 @@
+name: Windows Build (Ada sm_89, r12 + A3)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "master", "main", "r12-a3-sm89" ]
+
+env:
+  VSLANG: "1033"
+  # 4070 Ti = AD104 = 60 SMs. The r12 tree schedules by SM count; leaving it at
+  # the per-arch default (128 for sm_89) would schedule this card as if it were
+  # a 4090. 0 = per-arch default.
+  NINFER_SM_COUNT: "60"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: FFmpeg (tree already vendors it)
+      shell: pwsh
+      run: |
+        if (Test-Path "ffmpeg\include\libavcodec") {
+          Write-Host "using the FFmpeg shipped inside this tree"
+          Get-ChildItem ffmpeg\bin\*.dll | Select-Object Name, Length
+        } else {
+          curl.exe -fsSL -o ffmpeg.zip "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg download failed" }
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
+          Move-Item ffmpeg_tmp\ffmpeg-master-latest-win64-gpl-shared ffmpeg
+          Remove-Item ffmpeg.zip -Force
+          Remove-Item ffmpeg_tmp -Recurse -Force
+        }
+
+    - name: Setup CUDA 13.3 (NVIDIA redist archives)
+      shell: pwsh
+      run: |
+        $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        $pkgs = @(
+          "cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.3.33-archive.zip",
+          "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.3.29-archive.zip",
+          "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.3.33-archive.zip",
+          "cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.3.33-archive.zip",
+          "libcublas/windows-x86_64/libcublas-windows-x86_64-13.5.1.27-archive.zip",
+          "libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.3.33-archive.zip",
+          "cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.3.29-archive.zip",
+          "cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.3.27-archive.zip",
+          "visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.3.27-archive.zip",
+          "cccl/windows-x86_64/cccl-windows-x86_64-13.3.3.3.1-archive.zip"
+        )
+        $tmp = Join-Path $env:RUNNER_TEMP "cuda-redist"
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        Push-Location $tmp
+        foreach ($p in $pkgs) {
+          $name = Split-Path $p -Leaf
+          curl.exe -fsSL -o $name "https://developer.download.nvidia.com/compute/cuda/redist/$p"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $name)) { throw "download failed: $p" }
+          $d = Join-Path $tmp $name.Replace('.zip','')
+          Expand-Archive -Path $name -DestinationPath $d -Force
+          $src = $d
+          $sub = @(Get-ChildItem -Directory $d)
+          if ($sub.Count -eq 1) { $src = $sub[0].FullName }
+          Copy-Item (Join-Path $src '*') $root -Recurse -Force
+        }
+        Pop-Location
+        "CUDA_PATH=$root" >> $env:GITHUB_ENV
+        "$root\bin" >> $env:GITHUB_PATH
+
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Toolchain check
+      shell: pwsh
+      run: |
+        cmake --version
+        ninja --version
+        & "$env:CUDA_PATH\bin\nvcc.exe" --version
+
+    - name: Configure CMake
+      shell: pwsh
+      run: |
+        cmake -B build -S . -G Ninja `
+          -DCMAKE_CUDA_ARCHITECTURES=89 `
+          -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe" `
+          -DNINFER_SM_COUNT=$env:NINFER_SM_COUNT `
+          -DNINFER_BUILD_APPS=ON -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      shell: pwsh
+      run: cmake --build build --config Release -j 8 -- -k 0
+
+    - name: Stage binaries
+      if: always()
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path dist | Out-Null
+        foreach ($f in @("ninfer.exe","ninfer-serve.exe","ninfer-perplexity.exe")) {
+          if (Test-Path "build\apps\$f") { Copy-Item "build\apps\$f" dist\ }
+        }
+        Copy-Item ffmpeg\bin\*.dll dist\ -ErrorAction SilentlyContinue
+        if (Test-Path start_4090.bat) { Copy-Item start_4090.bat dist\ }
+        Get-ChildItem dist | Select-Object Name, Length
+
+    - name: Upload binaries
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ninfer-windows-sm89
+        if-no-files-found: warn
+        path: dist/
