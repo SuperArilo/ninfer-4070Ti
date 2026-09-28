@@ -6848,7 +6848,7 @@ ProgramImplCore::materialization_deficit(const ResourceCandidateState& admission
     // would forbid Device-to-Host demotion even when Host capacity is available.
     const detail::PhysicalResources required =
         checked_resource_sum(physical_occupancy(), admission.demand.physical_peak_additional);
-    return positive_resource_difference(required, admission_capacity());
+    return positive_resource_difference(required, planning_capacity());
 }
 
 detail::PhysicalResources
@@ -6862,12 +6862,12 @@ ProgramImplCore::guided_materialization_deficit(const ResourceCandidateState& ad
         pressure.removed);
     const detail::PhysicalResources required =
         checked_resource_sum(physical_occupancy(), projected_peak);
-    return positive_resource_difference(required, admission_capacity());
+    return positive_resource_difference(required, planning_capacity());
 }
 
 bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
     const detail::PhysicalResources occupied = physical_occupancy();
-    const detail::PhysicalResources limits   = admission_capacity();
+    const detail::PhysicalResources limits   = planning_capacity();
     const auto fits_u32 = [](std::uint32_t used, std::uint32_t added, std::uint32_t capacity) {
         return added <= capacity && used <= capacity - added;
     };
@@ -9466,6 +9466,28 @@ detail::PhysicalResources ProgramImplCore::admission_capacity() const noexcept {
     };
 }
 
+// PREFILL HEADROOM (2026-09-28, second round). Prefill writes one whole chunk per step, so a
+// request that fills the device pool to the brim still asks for `prefill_chunk` more pages on its
+// final step. Booking that chunk out of the capacity that every admission and planning decision
+// compares against keeps the shortfall out of the executing path: the request is
+// PermanentlyInfeasible at admission (a clean per-request ContextLengthExceeded), and the
+// occupancy-aware planner is forced to demote or evict a cached owner instead of declaring the
+// plan feasible and then dying inside prefill with "KVMem prefill capacity recovery could not
+// admit the next chunk".
+[[nodiscard]] std::uint32_t ProgramImplCore::prefill_chunk_headroom_pages() const noexcept {
+    return (prefill_chunk + static_cast<std::uint32_t>(kPagedKVPageSize) - 1U) /
+           static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+[[nodiscard]] detail::PhysicalResources ProgramImplCore::planning_capacity() const noexcept {
+    detail::PhysicalResources capacity = admission_capacity();
+    const std::uint32_t headroom       = prefill_chunk_headroom_pages();
+    capacity.device.main_kv_pages      = capacity.device.main_kv_pages > headroom
+                                             ? capacity.device.main_kv_pages - headroom
+                                             : 0U;
+    return capacity;
+}
+
 bool ProgramImplCore::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
     if (base.impl_ == nullptr) { return false; }
     // PREFILL ADMISSION HEADROOM (2026-09-28). A request's demand accounts for every KV page its
@@ -9477,14 +9499,7 @@ bool ProgramImplCore::isolated_request_feasible(const RequestBasePlan& base) con
     // full 131072 pool: a 130,380 token prompt died at cursor=1024 with free=14 need=16.
     // Keeping that chunk out of the admission budget makes such a request PermanentlyInfeasible,
     // which the engine already reports as a clean per-request ContextLengthExceeded.
-    detail::PhysicalResources capacity = admission_capacity();
-    {
-        const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
-        const std::uint32_t headroom_pages = (prefill_chunk + page_size - 1U) / page_size;
-        capacity.device.main_kv_pages = capacity.device.main_kv_pages > headroom_pages
-                                            ? capacity.device.main_kv_pages - headroom_pages
-                                            : 0U;
-    }
+    detail::PhysicalResources capacity = planning_capacity();
     const auto fits                          = [](detail::PhysicalResources value,
                          detail::PhysicalResources limit) noexcept {
         return value.device.active_lanes <= limit.device.active_lanes &&
@@ -9531,14 +9546,7 @@ bool ProgramImplCore::persistent_backfill_safe(
     // full 131072 pool: a 130,380 token prompt died at cursor=1024 with free=14 need=16.
     // Keeping that chunk out of the admission budget makes such a request PermanentlyInfeasible,
     // which the engine already reports as a clean per-request ContextLengthExceeded.
-    detail::PhysicalResources capacity = admission_capacity();
-    {
-        const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
-        const std::uint32_t headroom_pages = (prefill_chunk + page_size - 1U) / page_size;
-        capacity.device.main_kv_pages = capacity.device.main_kv_pages > headroom_pages
-                                            ? capacity.device.main_kv_pages - headroom_pages
-                                            : 0U;
-    }
+    detail::PhysicalResources capacity = planning_capacity();
     const auto fits                          = [](detail::PhysicalResources value,
                          detail::PhysicalResources limit) noexcept {
         return value.device.active_lanes <= limit.device.active_lanes &&

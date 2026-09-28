@@ -1392,10 +1392,27 @@ private:
         }
         setup.finish();
         ProgramCallScope program_call(*this);
-        auto progress =
-            instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
-        program_call.finish(progress.timing);
-        resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        // REQUEST-SCOPED PREFILL FAILURE (2026-09-28, second round). Any operational failure inside
+        // prefill used to escape to the worker loop, whose catch(...) fail-stops the whole engine:
+        // one request that could not make progress answered 503 for every later request until the
+        // process was restarted. A runtime failure (capacity recovery that cannot reclaim a page,
+        // a host-arena allocation the machine refuses) now fails only the request that owns the
+        // lane and the engine keeps serving. Program invariant violations (std::logic_error, and
+        // the invalid_argument configuration errors derived from it) stay fatal on purpose.
+        try {
+            auto progress = instance_.program->advance_prefill(*request->sequence,
+                                                               &program_call.failed_timing());
+            program_call.finish(progress.timing);
+            resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        } catch (const std::bad_alloc&) {
+            program_call.finish(program_call.failed_timing());
+            fail_active_lane_locked(lane, std::current_exception());
+            return;
+        } catch (const std::runtime_error&) {
+            program_call.finish(program_call.failed_timing());
+            fail_active_lane_locked(lane, std::current_exception());
+            return;
+        }
         publish_runtime_stats();
     }
 
@@ -1894,6 +1911,44 @@ private:
             request->model_state = EngineRequestState::DecodeReady;
         }
         publish_runtime_stats();
+    }
+
+    // One request that cannot make progress fails alone. The lane is unwound exactly the way an
+    // active cancellation unwinds it (Program abort, output preview, slot removal) and the request
+    // completes with the original error, which the serve layer maps to a per-request 4xx/5xx. Any
+    // surprise during the unwind escalates to the conservative fail-everything path: the engine
+    // never keeps running with a lane it cannot describe.
+    void fail_active_lane_locked(std::uint32_t lane, std::exception_ptr error) noexcept {
+        const std::shared_ptr<Request> request = slots_[lane];
+        try {
+            if (request != nullptr && request->sequence && request->lane &&
+                request->lane->value == lane && !request->capture_pending) {
+                (void)request->output.preview_terminal(FinishReason::Cancelled);
+                auto aborted =
+                    resources_.abort(*instance_.program, *request->lane, *request->sequence);
+                request->generation_timings = aborted.timings;
+                request->speculative_stats  = std::move(aborted.speculative);
+                if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
+                append_output(request, request->output.commit_preview());
+                complete_error(request, error);
+                remove_completed_slot(lane);
+                publish_runtime_stats();
+                return;
+            }
+        } catch (...) {
+            fail_all_locked(error);
+            return;
+        }
+        // No sequence binding to unwind: drop the lane bookkeeping, then fail the request.
+        try {
+            if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
+            slots_[lane].reset();
+            request_admission_check();
+            if (request != nullptr) { complete_error(request, error); }
+            publish_runtime_stats();
+        } catch (...) {
+            fail_all_locked(error);
+        }
     }
 
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no

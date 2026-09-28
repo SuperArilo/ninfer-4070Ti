@@ -663,6 +663,8 @@ public:
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
+    [[nodiscard]] std::uint32_t prefill_chunk_headroom_pages() const noexcept;
+    [[nodiscard]] detail::PhysicalResources planning_capacity() const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept {
