@@ -85,7 +85,7 @@ jobs:
         cmake -B build -S . -G Ninja `
           -DCMAKE_CUDA_ARCHITECTURES=89 `
           -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe" `
-          -DNINFER_SM_COUNT=$env:NINFER_SM_COUNT `
+          -DNINFER_SM_COUNT=${{ env.NINFER_SM_COUNT }} `
           -DNINFER_BUILD_APPS=ON -DCMAKE_BUILD_TYPE=Release
 
     - name: Build
