@@ -3,6 +3,10 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 #include "ops/kvmem/kvmem_window_plan.h"
+// The causal-scoring plan reserves the ternary rotation scratch, so the declaration
+// has to be visible here; without it the scoring path compiles a blank identifier
+// into the plan and dies with bad_alloc at runtime.
+#include "ops/linear/ternary/ternary_rotation.h"
 
 #include "core/device.h"
 #include "ninfer/ops/gated_delta_net.h"
