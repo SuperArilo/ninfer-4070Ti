@@ -459,7 +459,15 @@ DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
         throw std::overflow_error("arena allocation end offset overflows size_t");
     }
     const std::size_t end = aligned_offset + bytes;
-    if (end > cap_) { throw std::bad_alloc(); }
+    if (end > cap_) {
+        // raw_k_shadow.cpp complains that a bare bad_alloc "discards exactly this kind of
+        // information" and costs a rebuild-and-guess cycle. Carry the numbers.
+        std::fprintf(stderr,
+                     "[arena] device workspace exhausted: this request %zu B would end at %zu B, "
+                     "capacity %zu B, used %zu B, peak %zu B, short by %zu B\n",
+                     bytes, end, cap_, off_, peak_, end - cap_);
+        throw std::bad_alloc();
+    }
 
     auto* ptr = static_cast<unsigned char*>(base_) + aligned_offset;
     off_      = end;
