@@ -11740,7 +11740,13 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             // to the bridge frontier before the bridge writes. Same defect and same one-line fix
             // as the sibling tree tancau/ninfer-kvmem-ring (its log: 94465 and 117761, both
             // % 64 == 1); kept symmetric with the kvmem line (ninfer-4070Ti cranebw-capfix).
-            ensure_sequence_kv_mapped(sequence, staged.base,
+            // Only the BACKEND is extended. Mapping the text address to `staged.base` as well
+            // is wrong whenever this rung runs a KVMem window (pool < context): the text
+            // address then has far fewer descriptors than the prompt has pages, and the call
+            // trips "logical KV batch materialization exceeds descriptor capacity" (measured on
+            // the kvmem line, 190,040 token prompt, 2026-09-29). The text commit below keeps
+            // using sequence.text_kv_valid, which is already mapped.
+            ensure_sequence_kv_mapped(sequence, 0,
                                       sequence.kv->backend ? staged.base : 0U);
             mark_workspace_usage(workspace_plan.mtp_prefill);
             const Tensor& previous_hidden = sequence.tail_hidden;
