@@ -11731,6 +11731,17 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 staged.cursor >= staged.prompt_tokens) {
                 throw std::logic_error("staged MTP bridge is outside the reusable suffix");
             }
+            // FIX (mtp-bridge mapping): the bridge writes its draft KV at position base - 1 and
+            // then publishes mtp_kv_valid = base. On a reused prefix the backend mapping is
+            // inherited from the source checkpoint, whose backend frontier is base - 1: exactly
+            // base - 1 tokens. When base - 1 sits on a page boundary (base % 64 == 1) the bridge
+            // token lands one page past the mapped range, so the commit that follows is rejected
+            // with "KV committed frontier is invalid" and the engine fail-stops. Extend the mapping
+            // to the bridge frontier before the bridge writes. Same defect and same one-line fix
+            // as the sibling tree tancau/ninfer-kvmem-ring (its log: 94465 and 117761, both
+            // % 64 == 1); kept symmetric with the kvmem line (ninfer-4070Ti cranebw-capfix).
+            ensure_sequence_kv_mapped(sequence, staged.base,
+                                      sequence.kv->backend ? staged.base : 0U);
             mark_workspace_usage(workspace_plan.mtp_prefill);
             const Tensor& previous_hidden = sequence.tail_hidden;
             const schedule::MtpBridgeInput bridge{
