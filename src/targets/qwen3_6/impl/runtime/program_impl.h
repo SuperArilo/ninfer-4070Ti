@@ -11731,23 +11731,24 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 staged.cursor >= staged.prompt_tokens) {
                 throw std::logic_error("staged MTP bridge is outside the reusable suffix");
             }
-            // FIX (mtp-bridge mapping): the bridge writes its draft KV at position base - 1 and
-            // then publishes mtp_kv_valid = base. On a reused prefix the backend mapping is
-            // inherited from the source checkpoint, whose backend frontier is base - 1: exactly
-            // base - 1 tokens. When base - 1 sits on a page boundary (base % 64 == 1) the bridge
-            // token lands one page past the mapped range, so the commit that follows is rejected
-            // with "KV committed frontier is invalid" and the engine fail-stops. Extend the mapping
-            // to the bridge frontier before the bridge writes. Same defect and same one-line fix
-            // as the sibling tree tancau/ninfer-kvmem-ring (its log: 94465 and 117761, both
-            // % 64 == 1); kept symmetric with the kvmem line (ninfer-4070Ti cranebw-capfix).
-            // Only the BACKEND is extended. Mapping the text address to `staged.base` as well
-            // is wrong whenever this rung runs a KVMem window (pool < context): the text
-            // address then has far fewer descriptors than the prompt has pages, and the call
-            // trips "logical KV batch materialization exceeds descriptor capacity" (measured on
-            // the kvmem line, 190,040 token prompt, 2026-09-29). The text commit below keeps
-            // using sequence.text_kv_valid, which is already mapped.
+            // FIX (mtp-bridge frontier space): the bridge writes its draft KV at position
+            // base - 1 and then publishes mtp_kv_valid. The draft address lives on the SAME
+            // compacted window as the text address (the prefill offload compacts it too:
+            // backend_kv_addresses->kvmem_compact), so that frontier must be published in KV
+            // space. Publishing staged.base -- prompt space -- pushed the draft address's
+            // committed frontier up to the prompt frontier, and the next prefill-chunk commit
+            // (correctly in KV space) then walked it backwards and the engine fail-stopped
+            // with "KV committed frontier is invalid".
+            //
+            // Measured on the kvmem line, 2026-09-29 (190,040 token prompt, max-context
+            // 196608): first request 200 / 135.3 s; the identical reuse sent base=190035,
+            // kv_offset=-129024 and the commit went BACKWARDS: 61014 against committed 190035.
+            // Only the BACKEND is extended: mapping the text address to this frontier as well
+            // trips "logical KV batch materialization exceeds descriptor capacity" (its
+            // descriptors are the window, not the prompt).
+            const std::uint32_t bridge_frontier = kv_tokens(sequence.kv_offset, staged.base);
             ensure_sequence_kv_mapped(sequence, 0,
-                                      sequence.kv->backend ? staged.base : 0U);
+                                      sequence.kv->backend ? bridge_frontier : 0U);
             mark_workspace_usage(workspace_plan.mtp_prefill);
             const Tensor& previous_hidden = sequence.tail_hidden;
             const schedule::MtpBridgeInput bridge{
@@ -11766,7 +11767,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 schedule::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
                                                  bridge.position, bridge.rope_position, false);
             }
-            sequence.mtp_kv_valid = staged.base;
+            sequence.mtp_kv_valid = bridge_frontier;
             commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
             staged.mtp_bridge = MtpBridgeMode::None;
         }
