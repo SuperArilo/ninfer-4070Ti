@@ -2057,7 +2057,27 @@ private:
                 if (action == ExecutionAction::Decode) {
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    run_decode_round(membership, cancelled_at_unit_start);
+                    // REQUEST-SCOPED DECODE FAILURE (2026-09-30). A runtime failure inside a decode
+                    // round used to escape to this loop's catch(...), whose fail_all_locked() marks
+                    // the whole engine unusable: on 2026-09-30 08:25 one request whose KVMem pool
+                    // could not admit its speculative batch answered 500 and every later request
+                    // answered 503 until the process was restarted. With a single row in the round
+                    // the owner is unambiguous, so fail that request and keep serving; a multi-row
+                    // round cannot be attributed to one request and still fails the engine.
+                    // Program invariant violations (std::logic_error) stay fatal on purpose.
+                    try {
+                        run_decode_round(membership, cancelled_at_unit_start);
+                    } catch (const std::bad_alloc&) {
+                        if (membership.size != 1) { throw; }
+                        fail_active_lane_locked(membership.lanes[0], std::current_exception());
+                        previous_unit_was_decode = true;
+                        continue;
+                    } catch (const std::runtime_error&) {
+                        if (membership.size != 1) { throw; }
+                        fail_active_lane_locked(membership.lanes[0], std::current_exception());
+                        previous_unit_was_decode = true;
+                        continue;
+                    }
                     previous_unit_was_decode = true;
                     continue;
                 }

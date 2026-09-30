@@ -186,6 +186,19 @@ void append_failure_fields(std::ostringstream& out, const RequestFailure& failur
     } else {
         append_clause(out, classification_name(failure.classification));
     }
+    // A failure line without the exception text cannot be acted on: a production 500 in the decode
+    // phase logged only "internal error" and left the engine at 503 with nothing to chase. The
+    // text lives in machine_message (it is recorded in the request JSONL), and the console keeps
+    // it out on purpose; print it here too, truncated so one bad request cannot flood the log.
+    if (!failure.machine_message.empty()) {
+        constexpr std::size_t kMaximumFailureMessage = 240;
+        std::string message                          = failure.machine_message;
+        if (message.size() > kMaximumFailureMessage) {
+            message.resize(kMaximumFailureMessage);
+            message += "...";
+        }
+        append_clause(out, message);
+    }
 }
 
 } // namespace
