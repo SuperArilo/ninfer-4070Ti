@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -15,6 +16,21 @@
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail {
+
+// Capacity, not an invariant. The descriptor table running dry is decided by how large the
+// conversation grew, so it must fail only the request that grew: std::bad_alloc is the type the
+// request-scoped handlers catch (engine_core.h -- the prefill step and the decode round both treat
+// bad_alloc as a request failure). Ported from tancau/ninfer-kvmem-ring cb5b9bd0, which reached the
+// same conclusion after this path read as a bare logic_error that took the engine down.
+class KVCapacityExhausted : public std::bad_alloc {
+public:
+    explicit KVCapacityExhausted(std::string message) : message_(std::move(message)) {}
+    [[nodiscard]] const char* what() const noexcept override { return message_.c_str(); }
+
+private:
+    std::string message_;
+};
+
 
 class LogicalKVPageStore;
 class KVAddressSpaceStore;
@@ -293,7 +309,10 @@ public:
         if (destinations.empty()) { return; }
         if (destinations.size() > free_count_ ||
             destinations.size() > materialization_scratch_.capacity()) {
-            throw std::logic_error("logical KV batch materialization exceeds descriptor capacity");
+            throw KVCapacityExhausted("logical KV batch materialization exceeds descriptor capacity "
+                                      "(requested " + std::to_string(destinations.size()) +
+                                      ", free " + std::to_string(free_count_) + ", scratch " +
+                                      std::to_string(materialization_scratch_.capacity()) + ")");
         }
         for (const LogicalKVPageHandle destination : destinations) {
             if (destination.valid()) {

@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -60,8 +61,8 @@ private:
 
 class PublishedOutput {
 public:
-    using iterator       = std::array<OutputDelta, 2>::iterator;
-    using const_iterator = std::array<OutputDelta, 2>::const_iterator;
+    using iterator       = std::vector<OutputDelta>::iterator;
+    using const_iterator = std::vector<OutputDelta>::const_iterator;
 
     PublishedOutput()                                  = default;
     PublishedOutput(const PublishedOutput&)            = default;
@@ -89,7 +90,12 @@ public:
     void push_back(OutputDelta value);
 
 private:
-    std::array<OutputDelta, 2> values_{};
+    // LOCAL FIX (unbounded-channel-deltas): this was a fixed two-element array, which assumed a turn
+    // is at most "reasoning, then content" and threw std::logic_error on a third transition. That
+    // throw was untyped, so it reached the Engine's catch(...) and failed every request -- and a
+    // third transition is not exotic: content -> tool call -> content is ordinary output, and a
+    // model that reopens its reasoning produces a fourth. The limit was the bug, not the output.
+    std::vector<OutputDelta> values_{};
     std::size_t size_ = 0;
 };
 

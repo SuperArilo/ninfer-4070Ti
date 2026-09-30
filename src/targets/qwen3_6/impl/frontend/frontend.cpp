@@ -21,6 +21,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -735,41 +737,6 @@ bool exact_vision_frontier(std::uint32_t frontier, std::span<const VisionItem> i
     return true;
 }
 
-// W1/W2 · caller-supplied anchor positions (the directory layer's chosen moments).
-//
-// Semantics: move the decision of WHICH earlier recovery points to keep out of the prompt structure
-// (the engine's own shared/long boundaries) and into the caller -- the directory layer picks the
-// moment p, the engine drops immutable LongAnchors there, and every later request that diverges
-// after one of them can "restore that anchor and replay to the divergence" instead of recomputing
-// in full. Empty or 0 means OFF, which is the default, so an OFF arm reproduces today's expressions
-// exactly.
-//
-//   NINFER_TERNARY_KVMEM_ANCHOR=<token frontier>   one anchor at exactly p (W1)
-//   NINFER_TERNARY_KVMEM_CKPT_INTERVAL=<tokens>    an anchor every N tokens: N, 2N, 3N, ... (W2)
-//   NINFER_TERNARY_KVMEM_ANCHOR_MAX=<count>        cap on injected anchors, default 4 (W2)
-//
-// The cap matters: the engine keeps a per-continuation long-anchor set with a fixed capacity
-// (`--max-long-anchors-per-continuation`), and installing one more than capacity without a selected
-// replacement throws (`program_impl.h:7988`). Capping here keeps the injection inside that
-// capacity by construction instead of relying on the engine's eviction to save us.
-std::uint32_t anchor_env_value(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0') { return 0; }
-    char* end                       = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (end == value || end == nullptr || *end != '\0') {
-        throw std::invalid_argument(std::string(name) + " must be a decimal token count");
-    }
-    if (parsed > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::invalid_argument(std::string(name) + " exceeds the token frontier range");
-    }
-    return static_cast<std::uint32_t>(parsed);
-}
-
-std::uint32_t caller_anchor_frontier() {
-    return anchor_env_value("NINFER_TERNARY_KVMEM_ANCHOR");
-}
-
 PreparedContextCache prepare_context_cache(
     ContextCacheHints hints, std::size_t message_count,
     std::span<const std::optional<std::uint32_t>> message_boundaries,
@@ -812,11 +779,6 @@ PreparedContextCache prepare_context_cache(
         throw std::invalid_argument("context cache retention hint is invalid");
     }
     out.update_session_index = hints.update_session_index;
-    // W4 · restore-by-pos: deliberately NOT clamped here. Unlike the anchor above this field has no
-    // process-wide env fallback, so the warmup prompt cannot carry it (the failure that killed the
-    // engine at startup, frontend.cpp:916). The over-frontier skip belongs to the runtime, where the
-    // prompt token count is authoritative: resource_manager.h, restore_searchable.
-    out.restore_pos = hints.kvmem_restore_pos;
 
     for (const PromptCacheMarker marker : hints.markers) {
         switch (marker.kind) {
@@ -911,40 +873,6 @@ PreparedContextCache prepare_context_cache(
         add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
                         SharedCandidateEvidence::EngineObserved, full_prompt_frontier,
                         engine_order);
-    }
-    // W1/W2: the directory layer's moments, when armed. Off by default; nothing is injected while
-    // both switches are empty/0, so the OFF arm keeps today's opportunity set byte for byte.
-    //
-    // The switches are process-wide, so they also see prompts that are not the document at all --
-    // the engine's own warmup prompt is the first one. A frontier beyond THIS prompt is therefore
-    // skipped, not an error: it means "this prompt is shorter than that moment, so it carries no
-    // anchor". (Throwing here killed the engine at warmup -- measured, 2026-09-23: `FATAL warmup
-    // failed | NINFER_TERNARY_KVMEM_ANCHOR exceeds this prompt's token frontier`.)
-    // W3 · per-request p (this question's moment) wins over the process-wide switch:
-    // `hints.kvmem_anchor_pos` comes from the request body field `kvmem_anchor_pos`, while the env
-    // pair stays as the global fallback / interval form.
-    const std::uint32_t anchor_frontier =
-        hints.kvmem_anchor_pos != 0 ? hints.kvmem_anchor_pos : caller_anchor_frontier();
-    const std::uint32_t anchor_interval = anchor_env_value("NINFER_TERNARY_KVMEM_CKPT_INTERVAL");
-    if (anchor_frontier != 0 || anchor_interval != 0) {
-        std::uint32_t cap = anchor_env_value("NINFER_TERNARY_KVMEM_ANCHOR_MAX");
-        if (cap == 0) { cap = 4U; }
-        std::uint32_t injected = 0;
-        // Counts attempts, not insertions: `add_opportunity` dedups by (kind, frontier), so a p that
-        // coincides with a multiple of the interval costs one unit of the cap. The cap is a safety
-        // bound (stay inside the engine's anchor capacity), not a contract, so that is deliberate.
-        const auto inject = [&](std::uint32_t frontier) {
-            if (frontier == 0 || frontier > full_prompt_frontier || injected >= cap) { return; }
-            add_opportunity(PromptCacheMarkerKind::PrivateLongAnchor,
-                            SharedCandidateEvidence::ExplicitBoundary, frontier, engine_order++);
-            ++injected;
-        };
-        inject(anchor_frontier);
-        for (std::uint64_t frontier = anchor_interval;
-             anchor_interval != 0 && frontier <= full_prompt_frontier && injected < cap;
-             frontier += anchor_interval) {
-            inject(static_cast<std::uint32_t>(frontier));
-        }
     }
     return out;
 }
@@ -1129,15 +1057,15 @@ PublishedOutput& PublishedOutput::operator=(PublishedOutput&& other) noexcept {
 }
 
 void PublishedOutput::clear() noexcept {
-    for (std::size_t index = 0; index < size_; ++index) { values_[index] = {}; }
+    values_.clear();
     size_ = 0;
 }
 
 void PublishedOutput::push_back(OutputDelta value) {
-    if (size_ == values_.size()) {
-        throw std::logic_error("output decoder produced more than two channel transitions");
-    }
-    values_[size_++] = std::move(value);
+    // LOCAL FIX (unbounded-channel-deltas): the fixed two-element buffer assumed a turn is at most
+    // reasoning-then-content and threw on a third transition, which took every request down with it.
+    values_.push_back(std::move(value));
+    size_ = values_.size();
 }
 
 OutputSession::OutputSession() noexcept                           = default;
@@ -1154,7 +1082,18 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
     if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
     if (impl_->semantic.control_pending) {
-        throw std::logic_error("model output cannot advance while thinking control is pending");
+        // LOCAL FIX (thinking-control-abandoned), ported from tancau/ninfer-kvmem-ring 24c8ea5c: the
+        // Engine asked for ordinary model tokens while a control handoff was still pending. That
+        // used to throw std::logic_error, an untyped exception that reaches the Engine's catch(...)
+        // and fails every request. Nothing is wrong with the model here -- the budget has already
+        // been enforced up to this point -- so drop the pending control and decode normally.
+        // feed_semantic_thinking clears the same flag when the model closes the thinking phase.
+        std::fprintf(stderr,
+                     "[ninfer] thinking control abandoned: model output advanced while a control "
+                     "handoff was pending (thinking_tokens=%u) -- decoding normally\n",
+                     impl_->semantic.model_thinking_tokens);
+        std::fflush(stderr);
+        impl_->semantic.control_pending = false;
     }
     if (tokens.empty()) {
         throw std::invalid_argument("cannot preview an empty generated-token round");
@@ -1204,7 +1143,20 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
             ++impl_->preview_semantic.model_thinking_tokens;
             if (impl_->preview_semantic.budget &&
                 impl_->preview_semantic.model_thinking_tokens > *impl_->preview_semantic.budget) {
-                throw std::logic_error("model output exceeded the licensed thinking budget");
+                // LOCAL FIX (thinking-budget-overshoot), ported from tancau/ninfer-kvmem-ring
+                // 24c8ea5c: the model produced more thinking tokens than the budget licenses. This
+                // threw std::logic_error, i.e. an untyped exception that reached the Engine's
+                // catch(...) and failed every in-flight request, so a runaway turn took the whole
+                // process with it. A budget is a limit: reaching it ends THIS turn. Keep everything
+                // produced so far and finish with OutputLimit so the client sees an honest reason and
+                // the engine keeps serving.
+                std::fprintf(stderr,
+                             "[ninfer] thinking budget exceeded: budget=%u produced=%u -- "
+                             "finishing the turn with OutputLimit\n",
+                             *impl_->preview_semantic.budget,
+                             impl_->preview_semantic.model_thinking_tokens);
+                std::fflush(stderr);
+                return complete(count, FinishReason::OutputLimit);
             }
             feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
         }
@@ -1248,7 +1200,12 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         return complete(count, limit_reason);
     }
     if (impl_->preview_semantic.in_reasoning && impl_->preview_semantic.budget &&
-        impl_->preview_semantic.model_thinking_tokens == *impl_->preview_semantic.budget) {
+        // LOCAL FIX (budget-fuse-ge), ported from tancau/ninfer-kvmem-ring 24c8ea5c: this compared
+        // with ==, so once the counter had gone past the budget -- exactly what the overshoot path
+        // above sees -- the fuse could never fire again and the model was free to think forever
+        // (16,037 thinking tokens against a 24,576 budget, with the fuse silently disarmed).
+        // >= re-arms it for any round that lands on or past the limit.
+        impl_->preview_semantic.model_thinking_tokens >= *impl_->preview_semantic.budget) {
         impl_->preview_semantic.control_pending = true;
         return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
     }
@@ -1310,10 +1267,48 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
                          impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
     }
     if (impl_->preview_semantic.in_reasoning) {
-        throw std::logic_error("canonical thinking control did not close the thinking phase");
+        // LOCAL FIX (thinking-control-refusal), ported from tancau/ninfer-kvmem-ring 15abab8e: the
+        // canonical control suffix did not close the thinking phase, so the model will not take the
+        // "stop reasoning and answer now" handoff. This used to throw std::logic_error, which no
+        // transaction-layer handler catches: it reached the Engine's catch(...) and failed EVERY
+        // request, so a run that merely exhausted its thinking budget ended the whole conversation
+        // (their log: twice in 198 requests, both times as a dead turn).
+        //
+        // A thinking budget is a LIMIT, so hitting it should end the turn, not the process. Refuse
+        // the control, keep whatever reasoning and content were already produced, and finish with
+        // OutputLimit so the client sees an honest reason and the engine keeps serving.
+        std::fprintf(stderr,
+                     "[ninfer] thinking control refused: model did not close the thinking phase "
+                     "(thinking_tokens=%u control_tokens=%zu) -- finishing the turn with OutputLimit "
+                     "instead of ending the request\n",
+                     impl_->preview_semantic.model_thinking_tokens,
+                     static_cast<std::size_t>(tokens.size()));
+        std::fflush(stderr);
+        impl_->preview_semantic.control_pending = false;
+        impl_->preview_semantic.applied         = true;
+        terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
+        impl_->preview_ready = true;
+        return runtime::OutputDecision{
+            .accepted_tokens = static_cast<std::uint32_t>(tokens.size()),
+            .finish_reason   = FinishReason::OutputLimit,
+        };
     }
     if (impl_->split_reasoning && impl_->preview_state.in_reasoning) {
-        throw std::logic_error("canonical thinking control did not close the reasoning channel");
+        // Same refusal, same consequence: a split channel that will not close is a limit reached,
+        // not a broken contract.
+        std::fprintf(stderr,
+                     "[ninfer] thinking control refused: reasoning channel did not close "
+                     "(thinking_tokens=%u) -- finishing the turn with OutputLimit\n",
+                     impl_->preview_semantic.model_thinking_tokens);
+        std::fflush(stderr);
+        impl_->preview_semantic.control_pending = false;
+        impl_->preview_semantic.applied         = true;
+        terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
+        impl_->preview_ready = true;
+        return runtime::OutputDecision{
+            .accepted_tokens = static_cast<std::uint32_t>(tokens.size()),
+            .finish_reason   = FinishReason::OutputLimit,
+        };
     }
     impl_->preview_semantic.control_pending = false;
     impl_->preview_semantic.applied         = true;
