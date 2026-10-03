@@ -161,6 +161,7 @@ jobs:
           -DCMAKE_CUDA_ARCHITECTURES=89 `
           -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe" `
           -DCMAKE_PREFIX_PATH="$env:VCPKG_ROOT/installed/x64-windows" `
+          -DNINFER_D3D12_RESIDENCY=ON `
           -DVCPKG_TARGET_TRIPLET=x64-windows `
           -DNINFER_BUILD_APPS=ON `
           -DBUILD_TESTING=OFF 2>&1 | Tee-Object -FilePath ci-logs/configure.log
