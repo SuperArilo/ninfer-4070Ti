@@ -1,0 +1,154 @@
+name: Windows Build (ring / Ada sm_89)
+
+# Assembles the KVMem-ring tree and builds it for sm_89:
+#   baseline : iamwavecut/ninfer-all @ f118551fb401de073555807a48c50238e180e3b8 (VERSION 0.11.0-rtx3090)
+#   overlay  : 34 files from shensanshu/ninfer-master-shensanshu-kvmem (patches/changed-files/),
+#              fetched at build time and verified against RING-OVERLAY-SHA256.txt (34/34)
+# One arch per binary: this artifact is sm_89 only (RTX 4070 Ti / Ada).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "ring-sm89-kit" ]
+
+env:
+  VSLANG: "1033"
+  UPSTREAM_REPO: https://github.com/iamwavecut/ninfer-all
+  UPSTREAM_SHA: f118551fb401de073555807a48c50238e180e3b8
+  MS_REPO: https://modelscope.cn/api/v1/models/shensanshu/ninfer-master-shensanshu-kvmem/repo
+  MS_REV: master
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Assemble tree (baseline pin + verified ring overlay)
+      shell: pwsh
+      run: |
+        git clone -q "$env:UPSTREAM_REPO" upstream
+        git -C upstream fetch -q --depth 1 origin "$env:UPSTREAM_SHA"
+        git -C upstream checkout -q FETCH_HEAD
+        if (-not (Test-Path upstream/VERSION)) { throw "VERSION missing after checkout" }
+        Write-Host "VERSION = $(Get-Content upstream/VERSION)"
+
+        $lines = Get-Content "RING-OVERLAY-SHA256.txt" | Where-Object { $_.Trim() }
+        foreach ($l in $lines) {
+          $h = ($l -split '\s+')[0]
+          $p = ($l -split '\s+',2)[1].Trim()
+          $dst = Join-Path "upstream" $p
+          New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+          curl.exe -fsSL -G "$env:MS_REPO" --data-urlencode "Revision=$env:MS_REV" --data-urlencode "FilePath=patches/changed-files/$p" -o "$dst"
+          if ($LASTEXITCODE -ne 0) { throw "fetch failed: $p" }
+          # the published files are CRLF; normalise before hashing so the manifest matches
+          $bytes = [IO.File]::ReadAllBytes($dst)
+          $text  = [Text.Encoding]::UTF8.GetString($bytes).Replace("`r`n", "`n")
+          [IO.File]::WriteAllText($dst, $text, (New-Object Text.UTF8Encoding($false)))
+          $got = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $h) { throw "sha256 mismatch after normalise: $p / want $h / got $got" }
+        }
+        Write-Host "overlay verified: $($lines.Count) files"
+
+    - name: Setup CUDA 13.3 (NVIDIA redist archives)
+      shell: pwsh
+      run: |
+        $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        $pkgs = @(
+          "cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.3.33-archive.zip",
+          "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.3.29-archive.zip",
+          "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.3.33-archive.zip",
+          "cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.3.33-archive.zip",
+          "libcublas/windows-x86_64/libcublas-windows-x86_64-13.5.1.27-archive.zip",
+          "libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.3.33-archive.zip",
+          "cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.3.29-archive.zip",
+          "cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.3.27-archive.zip",
+          "visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.3.27-archive.zip",
+          "cccl/windows-x86_64/cccl-windows-x86_64-13.3.3.3.1-archive.zip"
+        )
+        $tmp = Join-Path $env:RUNNER_TEMP "cuda-redist"
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        Push-Location $tmp
+        foreach ($p in $pkgs) {
+          $name = Split-Path $p -Leaf
+          curl.exe -fsSL -o $name "https://developer.download.nvidia.com/compute/cuda/redist/$p"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $name)) { throw "download failed: $p" }
+          $dst = Join-Path $tmp $name.Replace('.zip','')
+          Expand-Archive -Path $name -DestinationPath $dst -Force
+          $src = $dst
+          $sub = @(Get-ChildItem -Directory $dst)
+          if ($sub.Count -eq 1) { $src = $sub[0].FullName }
+          Copy-Item (Join-Path $src '*') $root -Recurse -Force
+        }
+        Pop-Location
+        "CUDA_PATH=$root" >> $env:GITHUB_ENV
+        "$root\bin" >> $env:GITHUB_PATH
+
+    - name: Cache vcpkg (installed tree + downloads)
+      uses: actions/cache@v4
+      with:
+        path: |
+          C:\vcpkg\installed
+          C:\vcpkg\downloads
+        key: vcpkg-x64-windows-ring-v1
+
+    - name: Setup vcpkg (curl + ffmpeg[zlib] + pkgconf from upstream manifest)
+      shell: pwsh
+      run: |
+        $root = "C:\vcpkg"
+        if (-not (Test-Path "$root\.git")) {
+          git clone --depth 1 https://github.com/microsoft/vcpkg $root
+          & "$root\bootstrap-vcpkg.bat"
+        }
+        & "$root\vcpkg.exe" install --triplet x64-windows --x-manifest-root="$env:GITHUB_WORKSPACE\upstream" --x-install-root="$root\installed"
+        if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+        "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
+        "VCPKG_TARGET_TRIPLET=x64-windows" >> $env:GITHUB_ENV
+
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Toolchain check
+      shell: pwsh
+      run: |
+        cmake --version
+        ninja --version
+        & "$env:CUDA_PATH\bin\nvcc.exe" --version
+
+    - name: Configure CMake (sm_89)
+      shell: pwsh
+      run: |
+        cmake -B upstream/build -S upstream -G Ninja `
+          -DCMAKE_BUILD_TYPE=Release `
+          -DCMAKE_CUDA_ARCHITECTURES=89 `
+          -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe" `
+          -DCMAKE_PREFIX_PATH="$env:VCPKG_ROOT/installed/x64-windows" `
+          -DVCPKG_TARGET_TRIPLET=x64-windows `
+          -DNINFER_BUILD_APPS=ON `
+          -DBUILD_TESTING=OFF
+
+    - name: Build
+      shell: pwsh
+      run: cmake --build upstream/build --config Release -j 8 -- -k 0
+
+    - name: Stage binaries
+      if: always()
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path dist | Out-Null
+        foreach ($f in @("ninfer.exe","ninfer-serve.exe","ninfer-perplexity.exe")) {
+          if (Test-Path "upstream\build\apps\$f") { Copy-Item "upstream\build\apps\$f" dist\ }
+        }
+        Copy-Item "$env:CUDA_PATH\bin\cublas64_*.dll","$env:CUDA_PATH\bin\cublasLt64_*.dll","$env:CUDA_PATH\bin\cudart64_*.dll" dist\ -ErrorAction SilentlyContinue
+        Copy-Item "$env:VCPKG_ROOT\installed\x64-windows\bin\*.dll" dist\ -ErrorAction SilentlyContinue
+        Get-ChildItem dist | Select-Object Name, Length
+
+    - name: Upload binaries
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ninfer-ring-windows-sm89
+        if-no-files-found: warn
+        path: dist/
