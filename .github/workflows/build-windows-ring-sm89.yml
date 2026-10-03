@@ -6,14 +6,20 @@ name: Windows Build (ring / Ada sm_89)
 #              fetched at build time and verified against RING-OVERLAY-SHA256.txt (34/34)
 # One arch per binary: this artifact is sm_89 only (RTX 4070 Ti / Ada).
 #
-# Diagnostics: configure/build output is teed into ci-logs/, and on failure the log is committed
-# back to this branch. Reason: GitHub needs a login to read Actions logs in the web UI and the
-# artifact zip needs auth too (anonymous = 401), but a committed log is readable from anywhere.
+# Diagnostics: configure/build output is teed into ci-logs/ and committed back to this branch on
+# failure (Actions logs need a login to read; a committed log does not).
+# Caching: the vcpkg triplet tree (ffmpeg is ~20 min to build) is restored by a fixed key and
+# saved under a run-scoped key with a prefix fallback, so later rounds do not pay for it again.
 
 on:
   workflow_dispatch:
   push:
     branches: [ "ring-sm89-kit" ]
+
+# one run per branch: a new push cancels the previous one instead of stacking
+concurrency:
+  group: ring-sm89-kit
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -24,6 +30,7 @@ env:
   UPSTREAM_SHA: f118551fb401de073555807a48c50238e180e3b8
   MS_REPO: https://modelscope.cn/api/v1/models/shensanshu/ninfer-master-shensanshu-kvmem/repo
   MS_REV: master
+  VCPKG_CACHE_KEY: vcpkg-x64-windows-ring-v1
 
 jobs:
   build:
@@ -61,6 +68,7 @@ jobs:
       shell: pwsh
       run: |
         $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+        if (Test-Path "$root\bin\nvcc.exe") { Write-Host "CUDA already present, skipping"; "CUDA_PATH=$root" >> $env:GITHUB_ENV; "$root\bin" >> $env:GITHUB_PATH; exit 0 }
         New-Item -ItemType Directory -Force -Path $root | Out-Null
         $pkgs = @(
           "cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.3.33-archive.zip",
@@ -92,13 +100,16 @@ jobs:
         "CUDA_PATH=$root" >> $env:GITHUB_ENV
         "$root\bin" >> $env:GITHUB_PATH
 
-    - name: Cache vcpkg (installed tree + downloads)
-      uses: actions/cache@v4
+    - name: Restore vcpkg cache
+      id: vcpkg-cache
+      uses: actions/cache/restore@v4
       with:
         path: |
           C:\vcpkg\installed
           C:\vcpkg\downloads
-        key: vcpkg-x64-windows-ring-v1
+        key: ${{ env.VCPKG_CACHE_KEY }}
+        restore-keys: |
+          ${{ env.VCPKG_CACHE_KEY }}-
 
     - name: Setup vcpkg (curl + ffmpeg[zlib] + pkgconf from upstream manifest)
       shell: pwsh
@@ -112,6 +123,16 @@ jobs:
         if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
         "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
         "VCPKG_TARGET_TRIPLET=x64-windows" >> $env:GITHUB_ENV
+        Test-Path "$root/installed/x64-windows/lib/avcodec.lib"
+
+    - name: Save vcpkg cache
+      if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          C:\vcpkg\installed
+          C:\vcpkg\downloads
+        key: ${{ env.VCPKG_CACHE_KEY }}-${{ github.run_id }}
 
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
@@ -122,14 +143,14 @@ jobs:
         cmake --version
         ninja --version
         & "$env:CUDA_PATH\bin\nvcc.exe" --version
-        Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT (overridden by vcvars -- the configure step re-asserts ours)"
+        Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT (may be overridden by vcvars; the configure step re-asserts ours)"
 
     - name: Configure CMake (sm_89)
       shell: pwsh
       run: |
         # vcvars64 (the MSVC setup step) exports the Visual Studio-bundled VCPKG_ROOT and shadows
-        # ours, so FFMPEG is searched in the wrong tree. Re-assert the vcpkg tree we installed --
-        # the same pitfall is documented in the tree's own scripts/build-native.bat.
+        # ours, so FFMPEG is searched in the wrong tree. Re-assert the tree we installed -- the
+        # same pitfall is documented in the tree's own scripts/build-native.bat.
         $env:VCPKG_ROOT = 'C:\vcpkg'
         $env:VCPKG_TARGET_TRIPLET = 'x64-windows'
         Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT  triplet=$env:VCPKG_TARGET_TRIPLET"
@@ -151,16 +172,39 @@ jobs:
         cmake --build upstream/build --config Release -j 8 -- -k 0 2>&1 | Tee-Object -FilePath ci-logs/build.log
         if ($LASTEXITCODE -ne 0) { throw "build failed (see ci-logs/build.log)" }
 
-    - name: Commit diagnostics on failure
-      if: failure()
+    - name: Write status (always committed, so it is readable without a login)
+      if: always()
       shell: pwsh
       run: |
-        Get-ChildItem ci-logs -ErrorAction SilentlyContinue | Select-Object Name, Length
+        New-Item -ItemType Directory -Force -Path ci-logs | Out-Null
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine("run_id=$env:GITHUB_RUN_ID")
+        [void]$sb.AppendLine("sha=$env:GITHUB_SHA")
+        [void]$sb.AppendLine("time=$([DateTime]::UtcNow.ToString('u'))")
+        foreach ($f in @("ninfer.exe","ninfer-serve.exe","ninfer-perplexity.exe")) {
+          $p = "dist\$f"
+          if (Test-Path $p) {
+            $h = (Get-FileHash $p -Algorithm SHA256).Hash.ToLower()
+            [void]$sb.AppendLine("built $f size=$((Get-Item $p).Length) sha256=$h")
+          } else {
+            [void]$sb.AppendLine("missing $f")
+          }
+        }
+        [void]$sb.AppendLine("configure_log_lines=$((Get-Content ci-logs/configure.log -ErrorAction SilentlyContinue | Measure-Object).Count)")
+        [void]$sb.AppendLine("build_log_lines=$((Get-Content ci-logs/build.log -ErrorAction SilentlyContinue | Measure-Object).Count)")
+        Set-Content -Path ci-logs/status.txt -Value $sb.ToString()
+        Get-Content ci-logs/status.txt
+
+    - name: Commit diagnostics
+      if: always()
+      shell: pwsh
+      run: |
         git config user.email "ci@local"
         git config user.name "ring-sm89 ci"
         git add -f ci-logs
-        git commit -m "ci: configure/build log from run $env:GITHUB_RUN_ID" || Write-Host "nothing to commit"
-        git push origin HEAD:ring-sm89-kit
+        git commit -m "ci: status/log from run $env:GITHUB_RUN_ID" || Write-Host "nothing to commit"
+        git pull --rebase --autostash origin ring-sm89-kit || Write-Host "rebase skipped"
+        git push origin HEAD:ring-sm89-kit || Write-Host "push skipped"
 
     - name: Stage binaries
       if: always()
