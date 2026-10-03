@@ -122,12 +122,18 @@ jobs:
         cmake --version
         ninja --version
         & "$env:CUDA_PATH\bin\nvcc.exe" --version
-        Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
-        Write-Host "VCPKG_TARGET_TRIPLET=$env:VCPKG_TARGET_TRIPLET"
+        Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT (overridden by vcvars -- the configure step re-asserts ours)"
 
     - name: Configure CMake (sm_89)
       shell: pwsh
       run: |
+        # vcvars64 (the MSVC setup step) exports the Visual Studio-bundled VCPKG_ROOT and shadows
+        # ours, so FFMPEG is searched in the wrong tree. Re-assert the vcpkg tree we installed --
+        # the same pitfall is documented in the tree's own scripts/build-native.bat.
+        $env:VCPKG_ROOT = 'C:\vcpkg'
+        $env:VCPKG_TARGET_TRIPLET = 'x64-windows'
+        Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT  triplet=$env:VCPKG_TARGET_TRIPLET"
+        Test-Path "$env:VCPKG_ROOT/installed/x64-windows/lib/avcodec.lib"
         New-Item -ItemType Directory -Force -Path ci-logs | Out-Null
         cmake -B upstream/build -S upstream -G Ninja `
           -DCMAKE_BUILD_TYPE=Release `
@@ -165,7 +171,7 @@ jobs:
           if (Test-Path "upstream\build\apps\$f") { Copy-Item "upstream\build\apps\$f" dist\ }
         }
         Copy-Item "$env:CUDA_PATH\bin\cublas64_*.dll","$env:CUDA_PATH\bin\cublasLt64_*.dll","$env:CUDA_PATH\bin\cudart64_*.dll" dist\ -ErrorAction SilentlyContinue
-        Copy-Item "$env:VCPKG_ROOT\installed\x64-windows\bin\*.dll" dist\ -ErrorAction SilentlyContinue
+        Copy-Item "C:\vcpkg\installed\x64-windows\bin\*.dll" dist\ -ErrorAction SilentlyContinue
         Copy-Item start-ring-12g.bat dist\ -ErrorAction SilentlyContinue
         Get-ChildItem dist | Select-Object Name, Length
 
