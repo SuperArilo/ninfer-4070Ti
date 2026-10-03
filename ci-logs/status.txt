@@ -1,0 +1,9 @@
+run_id=37095566206
+sha=578234accabc717ae9aa400ad2dda72b642e9733
+time=2026-10-03 07:06:54Z
+missing ninfer.exe
+missing ninfer-serve.exe
+missing ninfer-perplexity.exe
+configure_log_lines=37
+build_log_lines=51343
+

@@ -24,47 +24,14 @@
 -- Looking for pthread_create in pthread
 -- Looking for pthread_create in pthread - not found
 -- Found Threads: TRUE
--- Configuring incomplete, errors occurred!
-CMake Warning (policy) at C:/Program Files/CMake/share/cmake-4.4/Modules/FindPackageHandleStandardArgs.cmake:654 (_FPHSA_FAILURE_MESSAGE):
-  Policy CMP0219 is not set: Macro invocations preserve backslashes in
-  arguments.  Run "cmake --help-policy CMP0219" for policy details.  Use the
-  cmake_policy command to set the policy and suppress this warning.
+-- Found FFMPEG: C:\vcpkg/installed/x64-windows/include
+-- Found CURL: C:/vcpkg/installed/x64-windows/share/curl/CURLConfig.cmake (found suitable version "8.21.0", minimum required is "7.85")
+-- Configuring done (10.7s)
+-- Generating done (0.3s)
+CMake Warning (unused-cli):
+  Manually-specified variables were not used by the project:
 
-  Command "_FPHSA_FAILURE_MESSAGE" called with arguments containing
-  backslashes.
-
-  Since the policy is not set, backslashes in the arguments:
-
-   "missing swscale.lib in C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\vcpkg/installed/x64-windows/lib (the vcpkg tree lacks ffmpeg) (missing: FFMPEG_INCLUDE_DIRS FFMPEG_LIBRARY_DIRS FFMPEG_LIBRARIES) "
-
-  will be interpreted as escape sequences for compatibility.
-
-  Set the policy to NEW to instead pass
-
-   "missing swscale.lib in C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise\\VC\\vcpkg/installed/x64-windows/lib (the vcpkg tree lacks ffmpeg) (missing: FFMPEG_INCLUDE_DIRS FFMPEG_LIBRARY_DIRS FFMPEG_LIBRARIES) "
-
-  so that argument parsing will preserve the original values.
-Call Stack (most recent call first):
-  cmake/FindFFMPEG.cmake:45 (find_package_handle_standard_args)
-  cmake/Dependencies.cmake:22 (find_package)
-  CMakeLists.txt:207 (include)
-This warning is for project developers.  Use -Wno-author or -Wno-policy to
-suppress it.
-
-CMake Error at C:/Program Files/CMake/share/cmake-4.4/Modules/FindPackageHandleStandardArgs.cmake:282 (set):
-  Syntax error in cmake code at
-
-    C:/Program Files/CMake/share/cmake-4.4/Modules/FindPackageHandleStandardArgs.cmake:282
-
-  when parsing string
-
-    missing swscale.lib in C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\vcpkg/installed/x64-windows/lib (the vcpkg tree lacks ffmpeg) (missing: FFMPEG_INCLUDE_DIRS FFMPEG_LIBRARY_DIRS FFMPEG_LIBRARIES) 
-
-  Invalid character escape '\P'.
-Call Stack (most recent call first):
-  C:/Program Files/CMake/share/cmake-4.4/Modules/FindPackageHandleStandardArgs.cmake:654 (_FPHSA_FAILURE_MESSAGE)
-  cmake/FindFFMPEG.cmake:45 (find_package_handle_standard_args)
-  cmake/Dependencies.cmake:22 (find_package)
-  CMakeLists.txt:207 (include)
+    VCPKG_TARGET_TRIPLET
 
 
+-- Build files have been written to: D:/a/ninfer-4070Ti/ninfer-4070Ti/upstream/build
