@@ -5,11 +5,18 @@ name: Windows Build (ring / Ada sm_89)
 #   overlay  : 34 files from shensanshu/ninfer-master-shensanshu-kvmem (patches/changed-files/),
 #              fetched at build time and verified against RING-OVERLAY-SHA256.txt (34/34)
 # One arch per binary: this artifact is sm_89 only (RTX 4070 Ti / Ada).
+#
+# Diagnostics: configure/build output is teed into ci-logs/, and on failure the log is committed
+# back to this branch. Reason: GitHub needs a login to read Actions logs in the web UI and the
+# artifact zip needs auth too (anonymous = 401), but a committed log is readable from anywhere.
 
 on:
   workflow_dispatch:
   push:
     branches: [ "ring-sm89-kit" ]
+
+permissions:
+  contents: write
 
 env:
   VSLANG: "1033"
@@ -42,7 +49,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
           curl.exe -fsSL -G "$env:MS_REPO" --data-urlencode "Revision=$env:MS_REV" --data-urlencode "FilePath=patches/changed-files/$p" -o "$dst"
           if ($LASTEXITCODE -ne 0) { throw "fetch failed: $p" }
-          # the published files are CRLF; normalise before hashing so the manifest matches
           $bytes = [IO.File]::ReadAllBytes($dst)
           $text  = [Text.Encoding]::UTF8.GetString($bytes).Replace("`r`n", "`n")
           [IO.File]::WriteAllText($dst, $text, (New-Object Text.UTF8Encoding($false)))
@@ -116,10 +122,13 @@ jobs:
         cmake --version
         ninja --version
         & "$env:CUDA_PATH\bin\nvcc.exe" --version
+        Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
+        Write-Host "VCPKG_TARGET_TRIPLET=$env:VCPKG_TARGET_TRIPLET"
 
     - name: Configure CMake (sm_89)
       shell: pwsh
       run: |
+        New-Item -ItemType Directory -Force -Path ci-logs | Out-Null
         cmake -B upstream/build -S upstream -G Ninja `
           -DCMAKE_BUILD_TYPE=Release `
           -DCMAKE_CUDA_ARCHITECTURES=89 `
@@ -127,11 +136,25 @@ jobs:
           -DCMAKE_PREFIX_PATH="$env:VCPKG_ROOT/installed/x64-windows" `
           -DVCPKG_TARGET_TRIPLET=x64-windows `
           -DNINFER_BUILD_APPS=ON `
-          -DBUILD_TESTING=OFF
+          -DBUILD_TESTING=OFF 2>&1 | Tee-Object -FilePath ci-logs/configure.log
+        if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (see ci-logs/configure.log)" }
 
     - name: Build
       shell: pwsh
-      run: cmake --build upstream/build --config Release -j 8 -- -k 0
+      run: |
+        cmake --build upstream/build --config Release -j 8 -- -k 0 2>&1 | Tee-Object -FilePath ci-logs/build.log
+        if ($LASTEXITCODE -ne 0) { throw "build failed (see ci-logs/build.log)" }
+
+    - name: Commit diagnostics on failure
+      if: failure()
+      shell: pwsh
+      run: |
+        Get-ChildItem ci-logs -ErrorAction SilentlyContinue | Select-Object Name, Length
+        git config user.email "ci@local"
+        git config user.name "ring-sm89 ci"
+        git add -f ci-logs
+        git commit -m "ci: configure/build log from run $env:GITHUB_RUN_ID" || Write-Host "nothing to commit"
+        git push origin HEAD:ring-sm89-kit
 
     - name: Stage binaries
       if: always()
@@ -143,6 +166,7 @@ jobs:
         }
         Copy-Item "$env:CUDA_PATH\bin\cublas64_*.dll","$env:CUDA_PATH\bin\cublasLt64_*.dll","$env:CUDA_PATH\bin\cudart64_*.dll" dist\ -ErrorAction SilentlyContinue
         Copy-Item "$env:VCPKG_ROOT\installed\x64-windows\bin\*.dll" dist\ -ErrorAction SilentlyContinue
+        Copy-Item start-ring-12g.bat dist\ -ErrorAction SilentlyContinue
         Get-ChildItem dist | Select-Object Name, Length
 
     - name: Upload binaries
